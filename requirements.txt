@@ -1,0 +1,8 @@
+numpy>=2
+pyyaml>=6.0
+pytest>=8.0
+tiktoken>=0.7
+pyarrow>=14
+# Install PyTorch before this file. A default `pip install torch` may pull a
+# large CUDA build. CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# `datasets` is optional and is imported only when pack --download is passed.

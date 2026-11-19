@@ -1,0 +1,62 @@
+# Full NCM-iWSP-GPT1 target. Loadable, and counted with `count --estimate`
+# unless --instantiate is passed. CI does not build it.
+#
+# Aligned with NCM-GPT1's generator body and residual VQ schedule. It is not
+# a copy of the 2018 GPT-1 weights, and it is not the gradient model named
+# NCM-GPT1. Instantiating these modules on CPU measures tokenizer
+# 92,276,480 (92.28M, the same total NCM-GPT1 reported) and generator
+# 154,666,240 (154.67M). NCM-GPT1's generator was 101.69M with tied codebook
+# heads and a post-upsample conv. This harness leaves the heads untied and
+# does not include that conv or codebook EMA.
+name: NCM-iWSP-GPT1
+seed: 0
+heavy: true
+
+pretok:
+  kind: gpt2
+  pad_vocab_to: 50304
+
+tokenizer:
+  embed_dim: 384
+  context_length: 512
+  n_heads: 6          # official configs call this n_layers; it is the head count
+  dropout: 0.0
+  enc_layers: 0
+  dec_layers: 1
+  use_qk_norm: true
+  pre_quant_groupnorm: 8
+  codebook_size: 4096
+  # 1^2 .. 22^2, then 512 instead of 23^2. 23 levels, 4307 grid cells.
+  levels: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324, 361, 400, 441, 484, 512]
+  learned_l1_sampling: true
+  learned_l1_cascade: true
+  learned_l1_cascade_base: 4
+  quant_resi:
+    enabled: true
+    ratio: 0.5
+
+generator:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  bias: true
+  dropout: 0.0
+  prefix_len: 1
+  rope_base: 100000
+  use_rope: true
+  use_level_encoding: true
+  use_qk_norm: true
+  attn_pattern: block_diagonal
+  predict_level0: false
+
+data:
+  dataset: lucadiliello/bookcorpusopen
+  hidden_pct: 1
+  visible_pct: 1
+  max_windows: 0
+
+eval:
+  batch_size: 1
+  max_windows: 2
+  n_generate: 0
+  device: auto

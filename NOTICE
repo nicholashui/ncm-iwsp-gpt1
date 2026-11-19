@@ -1,0 +1,19 @@
+Third-party notices
+
+`ncm_iwsp_gpt1/models/` is an inference-only adaptation of HazyResearch/ncm
+at commit c70274273f489abc73832b2b98584a8483b6b203.
+
+  Copyright (c) 2025 hermann kumbong
+  MIT License. See the upstream LICENSE:
+  https://github.com/HazyResearch/ncm/blob/c70274273f489abc73832b2b98584a8483b6b203/LICENSE
+
+The harness shape (write, fixed eval, audit, dry loop) follows
+nicholashui/ncm-iwsp at commit 6b91c9f2768c01d4059eeec7f9c44e70de27adb9,
+which is also MIT. This repository does not modify that checkout.
+
+GPT-2 byte-level BPE is provided by the tiktoken package's `gpt2` encoding.
+No GPT-2 or NCM-GPT1 weights are included.
+
+The BookCorpus reconstruction `lucadiliello/bookcorpusopen` is not included.
+Read that dataset card before downloading or using it. This repository does
+not grant rights to the corpus.

@@ -1,0 +1,56 @@
+# Runnable NCM-iWSP-GPT1 config. BookCorpus text + GPT-2 BPE, at a size the
+# stub and the CPU dry loop can instantiate. This is not NCM-GPT1 and it is
+# not the 12x768 target. Context 32 is the square schedule cut off at L
+# (1^2..5^2, then 32 instead of 6^2). Packing the same way at 512 is what
+# configs/target.yaml does; pack_documents accepts that window directly.
+name: NCM-iWSP-GPT1-runnable
+seed: 0
+heavy: false
+
+pretok:
+  kind: gpt2
+  pad_vocab_to: 50304
+
+tokenizer:
+  embed_dim: 32
+  context_length: 32
+  n_heads: 4
+  dropout: 0.0
+  enc_layers: 0
+  dec_layers: 1
+  use_qk_norm: true
+  pre_quant_groupnorm: 8
+  codebook_size: 64
+  levels: [1, 4, 9, 16, 25, 32]
+  learned_l1_sampling: true
+  learned_l1_cascade: true
+  learned_l1_cascade_base: 4
+  quant_resi:
+    enabled: true
+    ratio: 0.5
+
+generator:
+  n_layer: 2
+  n_head: 4
+  n_embd: 32
+  bias: true
+  dropout: 0.0
+  prefix_len: 1
+  rope_base: 100000
+  use_rope: true
+  use_level_encoding: true
+  use_qk_norm: true
+  attn_pattern: block_diagonal
+  predict_level0: false
+
+data:
+  dataset: lucadiliello/bookcorpusopen
+  hidden_pct: 10
+  visible_pct: 10
+  max_windows: 32
+
+eval:
+  batch_size: 2
+  max_windows: 4
+  n_generate: 1
+  device: auto

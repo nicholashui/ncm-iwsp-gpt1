@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+dataset/
+datasets/
+data/
+cache/
+runs/
+*.pt
+*.jsonl
+*.arrow
+*.parquet
+*.bin
+bookcorpus*
+.DS_Store
