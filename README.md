@@ -2,9 +2,9 @@
 
 這個倉庫是 **NCM-iWSP-GPT1**：用程式寫下一概念模型（NCM）的權重，再交給固定的 evaluator 計分。資料與 NCM-GPT1 相同，是 Hugging Face [`lucadiliello/bookcorpusopen`](https://huggingface.co/datasets/lucadiliello/bookcorpusopen) 加上 GPT-2 BPE。它**不是** NCM-GPT1。
 
-**NCM-GPT1** 這個名字只留給 [nicholashui/ncm-gpt1](https://github.com/nicholashui/ncm-gpt1) 裡那個用梯度訓練的 BookCorpus 模型。本倉庫的 GitHub 名稱是 `ncp-iwsp-gpt1`，保持這個名字，不要改。不要把兩個系統當成同一個模型，也不要去改 `ncm-gpt1`、`ncm-iwsp` 或 `HazyResearch/ncm`。
+**NCM-GPT1** 這個名字只留給 [nicholashui/ncm-gpt1](https://github.com/nicholashui/ncm-gpt1) 裡那個用梯度訓練的 BookCorpus 模型。本倉庫是 [nicholashui/ncm-iwsp-gpt1](https://github.com/nicholashui/ncm-iwsp-gpt1)。系統名稱是 **NCM-iWSP-GPT1**，Python 套件是 `ncm_iwsp_gpt1`。不要把兩個系統當成同一個模型，也不要去改 `ncm-gpt1`、`ncm-iwsp` 或 `HazyResearch/ncm`。
 
-This repository is **NCM-iWSP-GPT1**: an NCM whose weights are written in Python and scored by a fixed evaluator. The data is the GPT-1-scale corpus used by NCM-GPT1 (`lucadiliello/bookcorpusopen`, GPT-2 BPE). The gradient BookCorpus model keeps the name **NCM-GPT1**. The GitHub repo name `ncp-iwsp-gpt1` stays as it is.
+This repository is **NCM-iWSP-GPT1**: an NCM whose weights are written in Python and scored by a fixed evaluator. The data is the GPT-1-scale corpus used by NCM-GPT1 (`lucadiliello/bookcorpusopen`, GPT-2 BPE). The gradient BookCorpus model keeps the name **NCM-GPT1**. This GitHub repository is [nicholashui/ncm-iwsp-gpt1](https://github.com/nicholashui/ncm-iwsp-gpt1). The Python package is `ncm_iwsp_gpt1`.
 
 The method is interpretable weight-space programming ([arXiv:2611.18114](https://arxiv.org/abs/2611.18114), code [csinva/weight-space-programming-autoresearch](https://github.com/csinva/weight-space-programming-autoresearch)). The network is the NCM hierarchy from [HazyResearch/ncm](https://github.com/HazyResearch/ncm) ([arXiv:2610.14162](https://arxiv.org/html/2610.14162v1)). Level 0 is not a transformer target. The evaluator owns that unigram. The loop shape follows the read-only pilot [nicholashui/ncm-iwsp](https://github.com/nicholashui/ncm-iwsp) (NCM-MiniMind-iWSP-pilot, commit `6b91c9f`) and is vendored here so this repo stands alone. That pilot is MiniMind data with an ASCII/byte pretok. This repo's primary path is BookCorpus and GPT-2 BPE.
 
@@ -47,25 +47,44 @@ GPT-2 BPE 來自 `tiktoken` 內建的 `gpt2` encoding，不是一份下載的模
 
 Tokenizer 的 92,276,480 與 NCM-GPT1 量到的 tokenizer 總數一致。NCM-GPT1 的 generator 是 **101,688,854**（101.69M），因為輸出頭綁在碼本上，而且有 `post_upsample_conv`。這裡的 generator 頭沒有綁定，也沒有那個 conv，所以是 154.67M。這不是 2018 GPT-1 的權重複製品，也不是把 NCM-GPT1 的 checkpoint 載進來。
 
+POSIX，使用安裝一節建立的 `.venv`：
+
 ```bash
-python -m ncm_iwsp_gpt1 count --config configs/gpt1_data.yaml
-python -m ncm_iwsp_gpt1 count --config configs/target.yaml            # estimate, same integers
-python -m ncm_iwsp_gpt1 count --config configs/target.yaml --instantiate
+.venv/bin/python -m ncm_iwsp_gpt1 count --config configs/gpt1_data.yaml
+.venv/bin/python -m ncm_iwsp_gpt1 count --config configs/target.yaml            # estimate, same integers
+.venv/bin/python -m ncm_iwsp_gpt1 count --config configs/target.yaml --instantiate
 ```
+
+Windows 把 `.venv/bin/python` 換成 `.venv\Scripts\python.exe`。
 
 `configs/gpt1_data.yaml` 是乾跑用的保守尺寸。`configs/target.yaml` 才是要對齊的完整 NCM-iWSP-GPT1：12 層 / 768 維 / 12 頭、上下文 512、23 層平方 schedule（`1²..22²` 然後用 512 而不是 `23²`）、每層 codebook 4096。層內的碼一次並行預測。`predict_level0` 維持 false。
 
 ## 安裝
 
-CPU 就夠跑 runnable config 的乾迴圈。有 CUDA 時，`eval` 和 `loop` 的預設裝置是 GPU（`--device auto`）。`--device cuda` 會在沒有 CUDA 時直接失敗。`--device cpu` 強制用 CPU。
+在專案根目錄建一個本地 `.venv`。它已經在 `.gitignore` 裡，不要提交。先用這個 venv 的 Python 裝 PyTorch，再裝 `requirements.txt`。下面的 CPU index 是通用文件。有 NVIDIA GPU 的機器請改裝與驅動相符的 CUDA wheel（見 [pytorch.org](https://pytorch.org)），然後同樣裝 `requirements.txt`。
 
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-pytest
+CPU 就夠跑 runnable config 的乾迴圈和煙霧測試。有 CUDA 時，`eval` 和 `loop` 的預設裝置是 GPU（`--device auto`）。`--device cuda` 會在沒有 CUDA 時直接失敗。`--device cpu` 強制用 CPU。
+
+Windows，checkout 在 `e:\Project\ncm-iwsp-gpt1`。沒有 `py` 啟動器時，把 `py -3` 換成 `python`。
+
+```bat
+cd /d e:\Project\ncm-iwsp-gpt1
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pytest
 ```
 
-有 NVIDIA GPU 時，改裝對應的 CUDA 版 PyTorch，再裝 `requirements.txt`。`--download` 才需要額外的 `datasets` 套件，預設不安裝、也不會上網抓語料。
+POSIX：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pytest
+```
+
+`--download` 才需要額外的 `datasets` 套件，預設不安裝、也不會上網抓語料。裝進同一個 venv：`.venv\Scripts\python.exe -m pip install datasets`，或 POSIX 的 `.venv/bin/python -m pip install datasets`。
 
 ## 打包 BookCorpus
 
@@ -73,16 +92,12 @@ pytest
 
 Runnable config 的 window 是 32。Target config 的 window 是 NCM-GPT1 用的 512。32 的 cache 不能拿去餵 512 的模型，反過來也不行。打包本身不會建立那 2.5 億參數的模組。
 
-合成段落（不是 BookCorpus）：
+合成段落（不是 BookCorpus）的 `pack` 寫在下一節，和乾跑用同一支 venv Python。
+
+本地 jsonl，欄位 `text` 或 `content`。不要把這個檔提交進 git。Windows 把 `.venv/bin/python` 換成 `.venv\Scripts\python.exe`。
 
 ```bash
-python -m ncm_iwsp_gpt1 pack --demo --config configs/gpt1_data.yaml --out cache/demo.pt
-```
-
-本地 jsonl，欄位 `text` 或 `content`。不要把這個檔提交進 git：
-
-```bash
-python -m ncm_iwsp_gpt1 pack \
+.venv/bin/python -m ncm_iwsp_gpt1 pack \
   --config configs/target.yaml \
   --jsonl /path/to/bookcorpusopen.jsonl \
   --max-docs 2000 \
@@ -92,24 +107,24 @@ python -m ncm_iwsp_gpt1 pack \
 本地 arrow、parquet，或 HF datasets cache 目錄：
 
 ```bash
-python -m ncm_iwsp_gpt1 pack \
+.venv/bin/python -m ncm_iwsp_gpt1 pack \
   --config configs/target.yaml \
   --arrow /path/to/bookcorpus.arrow \
   --max-docs 2000 \
   --out cache/bookcorpus.pt
 
-python -m ncm_iwsp_gpt1 pack \
+.venv/bin/python -m ncm_iwsp_gpt1 pack \
   --config configs/target.yaml \
   --hf-cache ~/.cache/huggingface/datasets/lucadiliello___bookcorpusopen \
   --max-docs 2000 \
   --out cache/bookcorpus.pt
 ```
 
-真的要下載時才加 `--download`。這不是預設，CI 沒有這一步：
+真的要下載時才加 `--download`。這不是預設，CI 沒有這一步。先把 `datasets` 裝進 `.venv`，再打包：
 
 ```bash
-pip install datasets
-python -m ncm_iwsp_gpt1 pack \
+.venv/bin/python -m pip install datasets
+.venv/bin/python -m ncm_iwsp_gpt1 pack \
   --config configs/target.yaml \
   --hf-dataset lucadiliello/bookcorpusopen \
   --download \
@@ -123,19 +138,21 @@ Cache 是一個 torch dict：`visible_train`、`visible`、`hidden`、`meta`，�
 
 Stub writer 不呼叫付費 API。Iteration 0 是隨機初始化。之後的 iteration 把 GPT-2 token embedding 寫成正弦、碼本寫成軸對齊的原型、generator 的輸入投影寫成縮放過的單位矩陣。那是閉式，不是結果。
 
-```bash
-python -m ncm_iwsp_gpt1 eval \
-  --config configs/gpt1_data.yaml \
-  --packed cache/demo.pt \
-  --iteration 0 \
-  --device cpu
+Windows：
 
-python -m ncm_iwsp_gpt1 loop \
-  --config configs/gpt1_data.yaml \
-  --packed cache/demo.pt \
-  --iters 3 \
-  --out runs/demo \
-  --device cpu
+```bat
+cd /d e:\Project\ncm-iwsp-gpt1
+.venv\Scripts\python.exe -m ncm_iwsp_gpt1 pack --demo --config configs/gpt1_data.yaml --out cache/demo.pt
+.venv\Scripts\python.exe -m ncm_iwsp_gpt1 eval --config configs/gpt1_data.yaml --packed cache/demo.pt --iteration 0 --device cpu
+.venv\Scripts\python.exe -m ncm_iwsp_gpt1 loop --config configs/gpt1_data.yaml --packed cache/demo.pt --iters 3 --out runs/demo --device cpu
+```
+
+POSIX：
+
+```bash
+.venv/bin/python -m ncm_iwsp_gpt1 pack --demo --config configs/gpt1_data.yaml --out cache/demo.pt
+.venv/bin/python -m ncm_iwsp_gpt1 eval --config configs/gpt1_data.yaml --packed cache/demo.pt --iteration 0 --device cpu
+.venv/bin/python -m ncm_iwsp_gpt1 loop --config configs/gpt1_data.yaml --packed cache/demo.pt --iters 3 --out runs/demo --device cpu
 ```
 
 有 GPU 時把 `--device cpu` 拿掉，或寫 `--device cuda`。預設 `auto` 會在有 CUDA 時用 CUDA。
@@ -160,9 +177,7 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 
 ## 測試
 
-```bash
-pytest
-```
+煙霧測試就是安裝一節裡的 `pytest`：Windows 用 `.venv\Scripts\python.exe -m pytest`，POSIX 用 `.venv/bin/python -m pytest`。GitHub Actions 在乾淨的 runner 上直接裝 CPU 版 PyTorch，不使用這份本地 `.venv`。
 
 涵蓋：GPT-2 BPE 把類似 BookCorpus 的短文打成 window（含長度 512）、文件級 hash split 的隔離、兩份 config 載入、上面的參數數量（runnable 與 target 都會在 CPU 上實例化）、audit 拒絕 backward / Adam / AdamW / 權重下載 / hidden 洩漏、以及合成 packed window 上的 forward。GitHub Actions 用 CPU 版 PyTorch 跑同一套。測試只用合成句子，不包含真的 BookCorpus。
 
