@@ -6,6 +6,8 @@
 
 This repository is **NCM-iWSP-GPT1**: an NCM whose weights are written in Python and scored by a fixed evaluator. The data is the GPT-1-scale corpus used by NCM-GPT1 (`lucadiliello/bookcorpusopen`, GPT-2 BPE). The gradient BookCorpus model keeps the name **NCM-GPT1**. This GitHub repository is [nicholashui/ncm-iwsp-gpt1](https://github.com/nicholashui/ncm-iwsp-gpt1). The Python package is `ncm_iwsp_gpt1`.
 
+`python -m ncm_iwsp_gpt1 finetune` is a separate gradient run of this untied generator, starting from the converted v10 init. The writer loop does not call it. See [`docs/finetune_kaggle.md`](docs/finetune_kaggle.md).
+
 The method is interpretable weight-space programming ([arXiv:2611.18114](https://arxiv.org/abs/2611.18114), code [csinva/weight-space-programming-autoresearch](https://github.com/csinva/weight-space-programming-autoresearch)). The network is the NCM hierarchy from [HazyResearch/ncm](https://github.com/HazyResearch/ncm) ([arXiv:2610.14162](https://arxiv.org/html/2610.14162v1)). Level 0 is not a transformer target. The evaluator owns that unigram. The loop shape follows the read-only pilot [nicholashui/ncm-iwsp](https://github.com/nicholashui/ncm-iwsp) (NCM-MiniMind-iWSP-pilot, commit `6b91c9f`) and is vendored here so this repo stands alone. That pilot is MiniMind data with an ASCII/byte pretok. This repo's primary path is BookCorpus and GPT-2 BPE.
 
 iWSP papers mostly hand-write much smaller nets. A stub cannot be assumed to program ~100M parameters in one shot. The runnable config is the size the dry loop actually builds. The target config is the full architecture, and it does instantiate on CPU for the parameter count.
@@ -14,7 +16,7 @@ iWSP papers mostly hand-write much smaller nets. A stub cannot be assumed to pro
 
 Writer 只能用閉式、由 seed 決定的方式覆寫張量。預設的 iteration 0 什麼都不寫，留下隨機初始化，那就是 baseline。
 
-訓練迴圈裡沒有 `loss.backward`、Adam、AdamW，也沒有任何梯度優化器。Audit 看的是程式本身（註解和字串不算），會拒絕：
+Writer 的迴圈裡沒有 `loss.backward`、Adam、AdamW，也沒有任何梯度優化器。`finetune` 是另外一條指令，只更新已經展開成 untied head 的 generator，見下文。Audit 看的是 writer 程式本身（註解和字串不算），會拒絕：
 
 - `loss.backward`、`torch.optim`、Adam / AdamW、`sklearn` 的 `.fit`
 - `train_tokenizer` / `train_generator`、codebook EMA（forward 不會更新碼本）
@@ -24,7 +26,7 @@ Writer 只能用閉式、由 seed 決定的方式覆寫張量。預設的 iterat
 
 `pytest` 也會掃這個套件有沒有同樣的訓練呼叫。掃描不是證明。Writer 自己的 Python 仍然可以想辦法作弊，這和 iWSP 論文裡的事後檢查是同一類限制。
 
-不要花 NCM-GPT1 的 Kaggle T4 額度。本倉庫不提交 Kaggle job，也不呼叫付費 API。
+Writer 迴圈不花 NCM-GPT1 的 Kaggle T4 額度。`finetune` 會用 T4，但只在 Nicholas 確認路徑之後，由他自己提交一份新的 notebook。本倉庫不代為提交 Kaggle job，也不呼叫付費 API。
 
 ## 授權
 
@@ -81,6 +83,22 @@ cd /d e:\Project\ncm-iwsp-gpt1
 `generator.pt` 和 `latest.pt` 也可以當作 `--generator`。成功之後 tokenizer + generator 是 246,942,720 個參數。`loop` / `eval` 的 `--init-checkpoint` 會在 `write_weights` 之前載入這份檔；stub 的 iteration 0 不會覆寫它。隨機初始化 baseline 仍然是 baseline。Config 必須和轉換時同一份。
 
 The same converter is `python -m ncm_iwsp_gpt1 convert`. Math, the post-upsample caveat, and the Kaggle notebook are in [`docs/convert_from_gradient_checkpoint.md`](docs/convert_from_gradient_checkpoint.md). Source paths are read-only. `--out` inside the export directory or under `/kaggle/input` is refused.
+
+## 從已轉換的 v10 init 做梯度微調
+
+這一步更新的是 **NCM-iWSP-GPT1** 的 generator：untied `Linear(768, 4096)`，沒有 post-upsample conv，tokenizer 載入後凍結。起點是 NicNicNic 上已經轉好的 `E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt`（92,276,480）和 `generator.pt`（154,666,240），格式是 `{model, step, converted_from, ...}`。這份微調留在這個架構裡，不會把權重送回 NCM-GPT1 的 trainer。
+
+把 `E:\Project\ncm-iwsp-gpt1-init` 做成一份新的 Kaggle dataset。不要寫進 `E:\Project\ncm-gpt1-kaggle-100k`，也不要改 kernel `nicholashuihk/ncm-gpt-1-train`。Packed windows 用 v10 已經打好的 `artifacts/packed_windows.pt`（在 export 的 artifacts 樹裡，不一定跟原始 tokenizer 放在一起）。語料是 `lucadiliello/bookcorpusopen`，GPT-2 BPE，context 512。不要重訓 tokenizer。
+
+預設是每個 GPU batch 1、gradient checkpointing、按 level 切開的 block attention、T4 上 fp16。v10 的 tied-head generator 用過 batch 2；這裡是 154.67M，所以從 batch 1 開始。Loss 預設 alpha 0、mid_aux 0，每個 code cell 一樣重。`val_ce_first`、`val_ce_mid`、`val_ce_last` 分開記。v10 後期的 loss 含 alpha 0.5 和 mid_aux 0.5，那個純量不能拿來跟 alpha 0 的曲線比。
+
+`kaggle/finetune_iwsp.ipynb` 的 `NICHOLAS_CONFIRMED` 預設是 False。Nicholas 先看路徑，再自己提交。檔名、schema 和指令在 [`docs/finetune_kaggle.md`](docs/finetune_kaggle.md)。
+
+```bash
+python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
+```
+
+`finetune` updates this generator from those two converted files. The tokenizer stays frozen. Writes go to `/kaggle/working` or `--out`, never under `/kaggle/input` or into the init directory. Default loss is alpha 0 and mid_aux 0. Validation records `val_ce_first`, `val_ce_mid`, and `val_ce_last` separately. Per-GPU batch defaults to 1 with checkpointing.
 
 ## 安裝
 
@@ -212,16 +230,20 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 | `configs/target.yaml` | 完整 NCM-iWSP-GPT1：12/768/12，23 層，codebook 4096，context 512 |
 | `ncm_iwsp_gpt1/pretok.py` | 凍結的 GPT-2 BPE，pad 到 50304 |
 | `ncm_iwsp_gpt1/packing.py` | 文件 hash split，段落打進固定 window |
-| `ncm_iwsp_gpt1/models/` | 只做推論的 VQ-VAE 與 generator |
+| `ncm_iwsp_gpt1/models/` | VQ-VAE 與 untied generator；finetune 會對 generator 開 checkpoint |
 | `ncm_iwsp_gpt1/writers/stub.py` | Writer 應該只改這個檔的複本 |
 | `ncm_iwsp_gpt1/evaluate.py` | 固定的指標 |
 | `ncm_iwsp_gpt1/audit.py` | 訓練、下載、hidden 洩漏 |
 | `ncm_iwsp_gpt1/loop.py` | propose / write / eval / audit |
-| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert` |
+| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert`、`finetune` |
 | `ncm_iwsp_gpt1/convert.py` | 閉式複製 tokenizer / body，展開 tied head，丟棄 post-upsample |
+| `ncm_iwsp_gpt1/finetune.py` | 從已轉換 init 梯度更新 untied generator；tokenizer 凍結 |
 | `docs/convert_from_gradient_checkpoint.md` | 公式、caveat、NicNicNic 與 Kaggle 指令 |
+| `docs/finetune_kaggle.md` | 上傳 init、接上 `artifacts/packed_windows.pt`、T4 預設、loss 怎麼比 |
 | `kaggle/convert_iwsp.py` | 新的 Kaggle notebook 用的轉換腳本，寫入 `/kaggle/working` |
 | `kaggle/convert_iwsp.ipynb` | 同一支腳本的 notebook 版，不提交 Kaggle job |
+| `kaggle/finetune_iwsp.py` | 新的微調腳本，只寫 `/kaggle/working`，需要 `--confirm` |
+| `kaggle/finetune_iwsp.ipynb` | 同一支微調腳本的 notebook，`NICHOLAS_CONFIRMED` 預設關閉 |
 
 ## 還沒解決的風險
 

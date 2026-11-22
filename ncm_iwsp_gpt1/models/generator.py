@@ -11,8 +11,13 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from ncm_iwsp_gpt1.models.layers import GeneratorBlock, LayerNorm, init_output_projections, precompute_rope_cos_sin
+
+
+def _run_block(hidden, block, attn_mask, rope, segments):
+    return block(hidden, attn_mask=attn_mask, rope_cos_sin=rope, segments=segments)
 
 
 class NextConceptGenerator(nn.Module):
@@ -96,6 +101,9 @@ class NextConceptGenerator(nn.Module):
                 self.register_buffer(f"rope_sin_gen_{index}", sin_k, persistent=False)
 
         init_output_projections(self, self.n_layer)
+        # Off unless a fine-tune run turns them on. Eval keeps the dense mask.
+        self.chunked_block_attn = False
+        self.gradient_checkpointing = False
 
     def forward(self, latents):
         prefix = self.prefix_len
@@ -107,8 +115,22 @@ class NextConceptGenerator(nn.Module):
             target = target + self.transformer.wle(self.lvl_1L)
         hidden = torch.cat([prefix_emb, target], dim=1)
         rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
+        if self.chunked_block_attn:
+            segments = (prefix, tuple(int(level) for level in self.levels[1:]))
+            attn_mask = None
+        else:
+            segments = None
+            attn_mask = self.attn_mask
+        recompute = bool(self.gradient_checkpointing) and self.training
         for block in self.transformer.blocks:
-            hidden = block(hidden, attn_mask=self.attn_mask, rope_cos_sin=rope)
+            if recompute:
+                # Bind the block in a default arg so the loop variable is not shared.
+                def _recompute(hidden, _block=block, _mask=attn_mask, _rope=rope, _segments=segments):
+                    return _run_block(hidden, _block, _mask, _rope, _segments)
+
+                hidden = checkpoint(_recompute, hidden, use_reentrant=False)
+            else:
+                hidden = block(hidden, attn_mask=attn_mask, rope_cos_sin=rope, segments=segments)
         hidden = self.transformer.ln_f(hidden)
         target_hidden = hidden[:, prefix:, :]
         pieces = []

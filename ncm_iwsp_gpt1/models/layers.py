@@ -3,8 +3,8 @@
 Adapted from HazyResearch/ncm ``models/common.py`` and ``models/vae.py``
 (MIT, Copyright (c) 2025 hermann kumbong), commit c702742. The decoder
 attention is the non-causal block in ``vae.py``. The generator attention is
-the masked, RoPE block in ``common.py``. Flex attention, gated MLPs, and
-training helpers are omitted.
+the masked, RoPE block in ``common.py``. Flex attention and gated MLPs are
+omitted. The same block-diagonal mask can be one additive mask or one SDPA per level.
 """
 
 from __future__ import annotations
@@ -100,6 +100,50 @@ class DecoderAttention(nn.Module):
         return self.resid_dropout(self.c_proj(y))
 
 
+def block_diagonal_attention(q, k, v, prefix_len, level_lengths, dropout_p=0.0):
+    """Same block-diagonal pattern as the dense additive mask, one SDPA per level.
+
+    Prefix queries attend only to the prefix. Each later level attends to the
+    prefix and to its own cells, and not to any other level. ``q``, ``k``, and
+    ``v`` are ``(batch, heads, time, dim)`` after RoPE has already been applied.
+    """
+    prefix_len = int(prefix_len)
+    lengths = [int(length) for length in level_lengths]
+    time = q.shape[2]
+    if prefix_len < 0 or sum(lengths) + prefix_len != time:
+        raise ValueError(
+            f"prefix {prefix_len} plus levels {lengths} must cover {time} positions"
+        )
+    pieces = []
+    if prefix_len:
+        pieces.append(
+            F.scaled_dot_product_attention(
+                q[:, :, :prefix_len],
+                k[:, :, :prefix_len],
+                v[:, :, :prefix_len],
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
+        )
+    cursor = prefix_len
+    prefix_k = k[:, :, :prefix_len]
+    prefix_v = v[:, :, :prefix_len]
+    for length in lengths:
+        query = q[:, :, cursor : cursor + length]
+        key = k[:, :, cursor : cursor + length]
+        value = v[:, :, cursor : cursor + length]
+        if prefix_len:
+            key = torch.cat([prefix_k, key], dim=2)
+            value = torch.cat([prefix_v, value], dim=2)
+        pieces.append(
+            F.scaled_dot_product_attention(
+                query, key, value, dropout_p=dropout_p, is_causal=False
+            )
+        )
+        cursor += length
+    return torch.cat(pieces, dim=2)
+
+
 class GeneratorAttention(nn.Module):
     """Masked attention with optional RoPE, used by the coarse-to-fine generator."""
 
@@ -119,7 +163,7 @@ class GeneratorAttention(nn.Module):
             self.q_norm = RMSNorm(head_dim)
             self.k_norm = RMSNorm(head_dim)
 
-    def forward(self, x, attn_mask=None, rope_cos_sin=None):
+    def forward(self, x, attn_mask=None, rope_cos_sin=None, segments=None):
         batch, time, channels = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         head_dim = channels // self.n_head
@@ -133,14 +177,21 @@ class GeneratorAttention(nn.Module):
             cos, sin = rope_cos_sin
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
-        )
+        dropout_p = self.dropout if self.training else 0.0
+        if segments is None:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
+        else:
+            prefix_len, level_lengths = segments
+            y = block_diagonal_attention(
+                q, k, v, prefix_len, level_lengths, dropout_p=dropout_p
+            )
         y = y.transpose(1, 2).contiguous().view(batch, time, channels)
         return self.resid_dropout(self.c_proj(y))
 
@@ -180,8 +231,8 @@ class GeneratorBlock(nn.Module):
         self.ln_2 = LayerNorm(n_embd, bias=bias)
         self.mlp = MLP(n_embd, bias=bias, dropout=dropout)
 
-    def forward(self, x, attn_mask=None, rope_cos_sin=None):
-        x = x + self.attn(self.ln_1(x), attn_mask=attn_mask, rope_cos_sin=rope_cos_sin)
+    def forward(self, x, attn_mask=None, rope_cos_sin=None, segments=None):
+        x = x + self.attn(self.ln_1(x), attn_mask=attn_mask, rope_cos_sin=rope_cos_sin, segments=segments)
         x = x + self.mlp(self.ln_2(x))
         return x
 

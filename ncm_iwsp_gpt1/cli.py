@@ -12,6 +12,7 @@ from ncm_iwsp_gpt1.build import build_models, parameter_report
 from ncm_iwsp_gpt1.config import load_config
 from ncm_iwsp_gpt1.convert import ConvertError, convert_files, load_converted_checkpoint
 from ncm_iwsp_gpt1.evaluate import evaluate_windows
+from ncm_iwsp_gpt1.finetune import FinetuneError, describe_run, run_finetune
 from ncm_iwsp_gpt1.loop import load_writer, run_dry_loop
 from ncm_iwsp_gpt1.packing import (
     demo_texts,
@@ -224,7 +225,10 @@ def _cmd_convert(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ncm_iwsp_gpt1",
-        description="NCM-iWSP-GPT1 harness. Writes weights in code. Does not train. Is not NCM-GPT1.",
+        description=(
+            "NCM-iWSP-GPT1. The writer loop scores closed-form weights. "
+            "finetune is a separate gradient run of the untied generator."
+        ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -299,7 +303,117 @@ def build_parser() -> argparse.ArgumentParser:
     )
     convert.add_argument("--device", default="cpu", help="device for --smoke-forward (cpu, cuda, or auto)")
     convert.set_defaults(func=_cmd_convert)
+
+    finetune = sub.add_parser(
+        "finetune",
+        help="gradient fine-tune the untied generator from a converted init",
+    )
+    finetune.add_argument("--config", default="configs/target.yaml")
+    finetune.add_argument("--tokenizer", default=None, help="converted tokenizer.pt (read-only)")
+    finetune.add_argument("--generator", default=None, help="converted generator.pt with untied heads (read-only)")
+    finetune.add_argument("--packed", default=None, help="artifacts/packed_windows.pt or an iWSP visible cache")
+    finetune.add_argument("--out", default=None, help="directory for checkpoints and logs")
+    finetune.add_argument("--dry-plan", action="store_true", help="print the run plan and exit without building")
+    finetune.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required to train. Nicholas confirms paths before any Kaggle submit.",
+    )
+    finetune.add_argument("--max-steps", type=int, default=100_000)
+    finetune.add_argument("--batch-size", type=int, default=1, help="per GPU. Default 1 is the T4-sized choice.")
+    finetune.add_argument("--grad-accum", type=int, default=1)
+    finetune.add_argument("--peak-lr", type=float, default=3e-5)
+    finetune.add_argument("--floor-lr", type=float, default=3e-6)
+    finetune.add_argument("--warmup", type=int, default=100)
+    finetune.add_argument("--weight-decay", type=float, default=0.1)
+    finetune.add_argument("--grad-clip", type=float, default=1.0)
+    finetune.add_argument("--alpha", type=float, default=0.0)
+    finetune.add_argument("--mid-aux", type=float, default=0.0)
+    finetune.add_argument("--corrupt-p-max", type=float, default=0.8)
+    finetune.add_argument("--corrupt-p-min", type=float, default=0.2)
+    finetune.add_argument("--val-every", type=int, default=1000)
+    finetune.add_argument("--val-windows", type=int, default=256)
+    finetune.add_argument("--val-batch-size", type=int, default=1)
+    finetune.add_argument("--save-every", type=int, default=1000)
+    finetune.add_argument("--log-every", type=int, default=50)
+    finetune.add_argument("--max-hours", type=float, default=None)
+    finetune.add_argument("--reserve-minutes", type=float, default=15.0)
+    finetune.add_argument("--resume", default="auto", help="auto, none, or a checkpoint path")
+    finetune.add_argument("--device", default="auto", help="auto, cuda, or cpu")
+    finetune.add_argument("--workers", type=int, default=0)
+    finetune.add_argument("--seed", type=int, default=None)
+    finetune.add_argument("--no-checkpointing", action="store_true")
+    finetune.add_argument("--no-chunked-attn", action="store_true")
+    finetune.set_defaults(func=_cmd_finetune)
     return parser
+
+
+def _cmd_finetune(args) -> int:
+    cfg = load_config(args.config)
+    options = {
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "peak_lr": args.peak_lr,
+        "floor_lr": args.floor_lr,
+        "warmup": args.warmup,
+        "max_steps": args.max_steps,
+        "weight_decay": args.weight_decay,
+        "alpha": args.alpha,
+        "mid_aux": args.mid_aux,
+        "corrupt_p_max": args.corrupt_p_max,
+        "corrupt_p_min": args.corrupt_p_min,
+        "val_windows": args.val_windows,
+        "gradient_checkpointing": not args.no_checkpointing,
+        "chunked_block_attn": not args.no_chunked_attn,
+    }
+    if args.dry_plan:
+        print(json.dumps(describe_run(cfg, options), indent=2))
+        return 0
+    if not args.confirm:
+        raise SystemExit(
+            "Pass --confirm after reviewing the input paths. "
+            "This command trains the untied NCM-iWSP-GPT1 generator and does not submit a Kaggle job. "
+            "Nicholas confirms before any Kaggle submit."
+        )
+    if not args.tokenizer or not args.generator or not args.packed or not args.out:
+        raise SystemExit("finetune needs --tokenizer, --generator, --packed, and --out")
+    try:
+        summary = run_finetune(
+            cfg,
+            args.tokenizer,
+            args.generator,
+            args.packed,
+            args.out,
+            batch_size=args.batch_size,
+            grad_accum=args.grad_accum,
+            peak_lr=args.peak_lr,
+            floor_lr=args.floor_lr,
+            warmup=args.warmup,
+            max_steps=args.max_steps,
+            weight_decay=args.weight_decay,
+            grad_clip=args.grad_clip,
+            alpha=args.alpha,
+            mid_aux=args.mid_aux,
+            corrupt_p_max=args.corrupt_p_max,
+            corrupt_p_min=args.corrupt_p_min,
+            val_every=args.val_every,
+            val_windows=args.val_windows,
+            val_batch_size=args.val_batch_size,
+            save_every=args.save_every,
+            log_every=args.log_every,
+            max_hours=args.max_hours,
+            reserve_minutes=args.reserve_minutes,
+            resume=args.resume,
+            device=args.device,
+            gradient_checkpointing=not args.no_checkpointing,
+            chunked_block_attn=not args.no_chunked_attn,
+            workers=args.workers,
+            seed=args.seed,
+        )
+    except FinetuneError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
 def main(argv=None) -> int:

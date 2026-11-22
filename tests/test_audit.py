@@ -59,9 +59,31 @@ def test_rejections(tmp_path):
         assert problems, name
 
 
+_FINETUNE = Path("ncm_iwsp_gpt1/finetune.py")
+
+
 def test_package_sources_do_not_train():
     root = Path("ncm_iwsp_gpt1")
     for path in root.rglob("*.py"):
+        if path.as_posix() == _FINETUNE.as_posix():
+            continue
         code = code_only(path.read_text(encoding="utf-8"))
         for banned in (".backward(", "torch.optim", "sklearn", "AdamW", "train_tokenizer", "train_generator"):
             assert banned not in code, f"{path} contains {banned}"
+
+
+def test_finetune_is_the_only_optimizer_module():
+    hits = []
+    for path in Path("ncm_iwsp_gpt1").rglob("*.py"):
+        code = code_only(path.read_text(encoding="utf-8"))
+        if any(bit in code for bit in (".backward(", "torch.optim", "AdamW")):
+            hits.append(path.as_posix())
+    assert hits == ["ncm_iwsp_gpt1/finetune.py"]
+    for rel in (
+        "ncm_iwsp_gpt1/loop.py",
+        "ncm_iwsp_gpt1/evaluate.py",
+        "ncm_iwsp_gpt1/audit.py",
+        "ncm_iwsp_gpt1/writers/stub.py",
+        "ncm_iwsp_gpt1/convert.py",
+    ):
+        assert "ncm_iwsp_gpt1.finetune" not in Path(rel).read_text(encoding="utf-8")
