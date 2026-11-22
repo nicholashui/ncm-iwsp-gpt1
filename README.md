@@ -45,7 +45,7 @@ GPT-2 BPE 來自 `tiktoken` 內建的 `gpt2` encoding，不是一份下載的模
 
 兩份 config 的詞表都是 GPT-2 BPE：50257 個原始 id，`<|endoftext|>` 是 50256，`<|pad|>` 是 50257，嵌入表補到 **50304**。這和 NCM-GPT1 的 `in_vocab_size` 相同。
 
-Tokenizer 的 92,276,480 與 NCM-GPT1 量到的 tokenizer 總數一致。NCM-GPT1 的 generator 是 **101,688,854**（101.69M），因為輸出頭綁在碼本上，而且有 `post_upsample_conv`。這裡的 generator 頭沒有綁定，也沒有那個 conv，所以是 154.67M。這不是 2018 GPT-1 的權重複製品，也不是把 NCM-GPT1 的 checkpoint 載進來。
+Tokenizer 的 92,276,480 與 NCM-GPT1 量到的 tokenizer 總數一致。NCM-GPT1 的 generator 是 **101,688,854**（101.69M），因為輸出頭綁在碼本上，而且有 `post_upsample_conv`。這裡的 generator 頭沒有綁定，也沒有那個 conv，所以是 154.67M。這不是 2018 GPT-1 的權重複製品。閉式轉換可以把一份已完成的 gradient checkpoint 填進這兩個模組，見下一節；本倉庫不附帶那份 checkpoint。
 
 POSIX，使用安裝一節建立的 `.venv`：
 
@@ -58,6 +58,29 @@ POSIX，使用安裝一節建立的 `.venv`：
 Windows 把 `.venv/bin/python` 換成 `.venv\Scripts\python.exe`。
 
 `configs/gpt1_data.yaml` 是乾跑用的保守尺寸。`configs/target.yaml` 才是要對齊的完整 NCM-iWSP-GPT1：12 層 / 768 維 / 12 頭、上下文 512、23 層平方 schedule（`1²..22²` 然後用 512 而不是 `23²`）、每層 codebook 4096。層內的碼一次並行預測。`predict_level0` 維持 false。
+
+## 從已完成的 gradient checkpoint 做閉式轉換
+
+轉換只做兩件事：同名張量原樣複製，以及把綁定碼本的輸出頭展開成這個倉庫的 `Linear(768, 4096, bias=True)`。公式、post-upsample 不能吸收的原因、以及 NicNicNic / Kaggle 指令寫在 [`docs/convert_from_gradient_checkpoint.md`](docs/convert_from_gradient_checkpoint.md)。
+
+Post-upsample conv 在每個 level 的 latent 上混鄰近位置（`chunk + Conv1d(chunk)`，發生在 `wte` 之前）。它不能寫進逐位置的 Linear，這個架構也不會加上那層。那些權重是剩下來用不到的。它們在初始化時是 0（恆等），step 100,000 時可能已經不是 0，所以整段 generator forward 只是近似。同一個 hidden 上，body 和展開後的頭是精確的。
+
+來源檔只讀。`--out` 若落在來源目錄或 `/kaggle/input` 裡，指令會拒絕寫入。不要把結果寫回 `E:\Project\ncm-gpt1-kaggle-100k`。Kaggle 用一份新的 notebook（`kaggle/convert_iwsp.ipynb`），不要去改 v10 training kernel。
+
+NicNicNic 上、之後才跑的指令（這裡不要執行）：
+
+```bat
+cd /d e:\Project\ncm-iwsp-gpt1
+.venv\Scripts\python.exe -m ncm_iwsp_gpt1 convert ^
+  --config configs\target.yaml ^
+  --tokenizer E:\Project\ncm-gpt1-kaggle-100k\tokenizer.pt ^
+  --generator E:\Project\ncm-gpt1-kaggle-100k\generator_step100000.pt ^
+  --out E:\Project\ncm-iwsp-gpt1\artifacts\ncm_iwsp_gpt1_from_100k.pt
+```
+
+`generator.pt` 和 `latest.pt` 也可以當作 `--generator`。成功之後 tokenizer + generator 是 246,942,720 個參數。`loop` / `eval` 的 `--init-checkpoint` 會在 `write_weights` 之前載入這份檔；stub 的 iteration 0 不會覆寫它。隨機初始化 baseline 仍然是 baseline。Config 必須和轉換時同一份。
+
+The same converter is `python -m ncm_iwsp_gpt1 convert`. Math, the post-upsample caveat, and the Kaggle notebook are in [`docs/convert_from_gradient_checkpoint.md`](docs/convert_from_gradient_checkpoint.md). Source paths are read-only. `--out` inside the export directory or under `/kaggle/input` is refused.
 
 ## 安裝
 
@@ -194,13 +217,17 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 | `ncm_iwsp_gpt1/evaluate.py` | 固定的指標 |
 | `ncm_iwsp_gpt1/audit.py` | 訓練、下載、hidden 洩漏 |
 | `ncm_iwsp_gpt1/loop.py` | propose / write / eval / audit |
-| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop` |
+| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert` |
+| `ncm_iwsp_gpt1/convert.py` | 閉式複製 tokenizer / body，展開 tied head，丟棄 post-upsample |
+| `docs/convert_from_gradient_checkpoint.md` | 公式、caveat、NicNicNic 與 Kaggle 指令 |
+| `kaggle/convert_iwsp.py` | 新的 Kaggle notebook 用的轉換腳本，寫入 `/kaggle/working` |
+| `kaggle/convert_iwsp.ipynb` | 同一支腳本的 notebook 版，不提交 Kaggle job |
 
 ## 還沒解決的風險
 
 - 沒有公開證據說 iWSP 寫得出深的殘差碼階層。這個 harness 可以記下失敗。
 - Audit 是原始碼掃描加上確定性檢查。它讀不到被藏在別的模組裡的訓練步驟。
-- 這裡的 generator 是 154.67M，不是 NCM-GPT1 的 101.69M。差在沒有綁定碼本的輸出頭，也沒有 `post_upsample_conv`。Tokenizer 的參數總數則與 NCM-GPT1 量到的 92.28M 相同。
+- 這裡的 generator 是 154.67M，不是 NCM-GPT1 的 101.69M。差在沒有綁定碼本的輸出頭，也沒有 `post_upsample_conv`。Tokenizer 的參數總數則與 NCM-GPT1 量到的 92.28M 相同。閉式轉換會把 tied head 展開成那 154.67M，並丟棄 post-upsample。整段 forward 因此只在那些 conv 仍為 0 時與來源一致。
 - Target 的一次 forward（序列長度約 4307）比數參數重得多。CI 會實例化它來核對參數數量，但不會用它跑語料。
 - Level-0 和各層 unigram 是 evaluator 在凍結的 visible-train window 上做的 add-one 計數，不是權重。Visible 很少的時候這個 baseline 會很吵。
 - 這次環境沒有下載或打包真正的 `lucadiliello/bookcorpusopen`。整本書可能很大；先用 `--max-docs`。一行一本書時，hash 仍是整篇文件，段落只用於打包。

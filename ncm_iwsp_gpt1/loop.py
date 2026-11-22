@@ -16,6 +16,7 @@ from pathlib import Path
 
 from ncm_iwsp_gpt1.audit import AuditError, audit_writer_module, state_dict_equal
 from ncm_iwsp_gpt1.build import build_models, lock_for_eval, parameter_report
+from ncm_iwsp_gpt1.convert import load_converted_checkpoint
 from ncm_iwsp_gpt1.device import resolve_device
 from ncm_iwsp_gpt1.evaluate import agent_view, evaluate_windows
 
@@ -73,7 +74,15 @@ def assert_writer_is_deterministic(cfg, writer) -> None:
         )
 
 
-def run_dry_loop(cfg, cache: dict, writer_path: str | Path, out_dir: str | Path, iterations: int = 3, device: str | None = None) -> dict:
+def run_dry_loop(
+    cfg,
+    cache: dict,
+    writer_path: str | Path,
+    out_dir: str | Path,
+    iterations: int = 3,
+    device: str | None = None,
+    init_checkpoint: str | Path | None = None,
+) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     snapshots = out / "snapshots"
@@ -186,6 +195,8 @@ def run_dry_loop(cfg, cache: dict, writer_path: str | Path, out_dir: str | Path,
     rows = []
     for step in range(int(iterations)):
         pretok, vqvae, generator = _fresh(cfg)
+        if init_checkpoint is not None:
+            load_converted_checkpoint(init_checkpoint, vqvae, generator)
         writer.write_weights(vqvae, generator, iteration=step)
         # Re-read the file each iteration so an external editor is what gets audited.
         problems = audit_writer_module(writer, writer_path)
@@ -306,6 +317,7 @@ def run_dry_loop(cfg, cache: dict, writer_path: str | Path, out_dir: str | Path,
         "hidden_log": str(hidden_log),
         "agent_scalar_name": "mean_level_ce",
         "device": str(resolved_device),
+        "init_checkpoint": str(init_checkpoint) if init_checkpoint else None,
     }
     _write_status(out, summary)
     return summary
