@@ -10,6 +10,7 @@ from pathlib import Path
 from ncm_iwsp_gpt1.audit import AuditError
 from ncm_iwsp_gpt1.build import build_models, parameter_report
 from ncm_iwsp_gpt1.config import load_config
+from ncm_iwsp_gpt1.convert import ConvertError, convert_files, load_converted_checkpoint
 from ncm_iwsp_gpt1.evaluate import evaluate_windows
 from ncm_iwsp_gpt1.loop import load_writer, run_dry_loop
 from ncm_iwsp_gpt1.packing import (
@@ -129,6 +130,11 @@ def _cmd_eval(args) -> int:
     cache = load_cache(args.packed)
     writer = load_writer(args.writer)
     pretok, vqvae, generator = build_models(cfg)
+    if args.init_checkpoint:
+        try:
+            load_converted_checkpoint(args.init_checkpoint, vqvae, generator)
+        except ConvertError as exc:
+            raise SystemExit(str(exc)) from exc
     writer.write_weights(vqvae, generator, iteration=int(args.iteration))
     split = cache["visible"] if args.split == "visible" else cache["visible_train"]
     metrics = evaluate_windows(
@@ -174,8 +180,16 @@ def _cmd_loop(args) -> int:
     cache = load_cache(args.packed)
     try:
         summary = run_dry_loop(
-            cfg, cache, args.writer, args.out, iterations=int(args.iters), device=args.device
+            cfg,
+            cache,
+            args.writer,
+            args.out,
+            iterations=int(args.iters),
+            device=args.device,
+            init_checkpoint=args.init_checkpoint,
         )
+    except ConvertError as exc:
+        raise SystemExit(str(exc)) from exc
     except AuditError as exc:
         print("audit rejected the writer:")
         for problem in exc.problems:
@@ -186,6 +200,24 @@ def _cmd_loop(args) -> int:
         "Agent-facing scalar is mean_level_ce in results.csv. "
         f"Hidden numbers are only in {summary['hidden_log']} and must not be shown to the writer."
     )
+    return 0
+
+
+def _cmd_convert(args) -> int:
+    cfg = load_config(args.config)
+    try:
+        report = convert_files(
+            args.tokenizer,
+            args.generator,
+            args.out,
+            cfg,
+            smoke_forward=bool(args.smoke_forward),
+            device=args.device,
+        )
+    except ConvertError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(report, indent=2))
+    print(f"wrote {args.out}")
     return 0
 
 
@@ -223,6 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--iteration", type=int, default=0)
     evaluate.add_argument("--split", choices=("visible", "visible_train"), default="visible")
     evaluate.add_argument("--device", default="auto", help="auto (CUDA if available), cuda, or cpu")
+    evaluate.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="converted checkpoint to load before write_weights (stub iteration 0 leaves it in place)",
+    )
     evaluate.set_defaults(func=_cmd_eval)
 
     loop = sub.add_parser("loop", help="local propose/write/eval/audit dry loop")
@@ -232,7 +269,36 @@ def build_parser() -> argparse.ArgumentParser:
     loop.add_argument("--out", required=True)
     loop.add_argument("--iters", type=int, default=3)
     loop.add_argument("--device", default="auto", help="auto (CUDA if available), cuda, or cpu")
+    loop.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help=(
+            "converted checkpoint loaded before each write_weights call. "
+            "The random-init baseline stays the seeded initialization. "
+            "Stub iteration 0 therefore scores the converted weights."
+        ),
+    )
     loop.set_defaults(func=_cmd_loop)
+
+    convert = sub.add_parser(
+        "convert",
+        help="expand a finished gradient checkpoint into untied NCM-iWSP-GPT1 weights",
+    )
+    convert.add_argument("--config", default="configs/target.yaml")
+    convert.add_argument("--tokenizer", required=True, help="tokenizer.pt (read-only)")
+    convert.add_argument(
+        "--generator",
+        required=True,
+        help="generator.pt, latest.pt, or generator_step100000.pt (read-only)",
+    )
+    convert.add_argument("--out", required=True, help="destination outside the source directory")
+    convert.add_argument(
+        "--smoke-forward",
+        action="store_true",
+        help="run one random forward after conversion; not a training step",
+    )
+    convert.add_argument("--device", default="cpu", help="device for --smoke-forward (cpu, cuda, or auto)")
+    convert.set_defaults(func=_cmd_convert)
     return parser
 
 
