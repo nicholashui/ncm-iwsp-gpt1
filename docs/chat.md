@@ -2,20 +2,23 @@
 
 `python -m ncm_iwsp_gpt1 chat` decodes one window of text. It is a front end on the existing `VQVAE.encode`, `NextConceptGenerator.generate`, and `VQVAE.decode_logits` path. It does not train, does not call the writer, and does not submit a Kaggle job.
 
-This model is not a causal language model and not NCM-GPT1. `predict_level0` is false, so level 0 is not a generator target. Both shipped configs set `prefix_len` to 1. The generator therefore reads at most one raw token, looked up in the tokenizer embedding with no position added.
+This model is not a causal language model and not NCM-GPT1. `predict_level0` is false, so level 0 is not a generator target. Both shipped configs set `prefix_len` to 1. That slot is `<|endoftext|>`, looked up in the tokenizer embedding with no position added. The words of the prompt reach the model only through the level-0 code of a window packed with those words.
 
 ## What one turn actually does
 
-1. GPT-2 BPE encodes the line. A leading space is part of the text; GPT-2 BPE keeps it.
-2. Tokens past the context are dropped. That context is 512 for `configs/target.yaml` and 32 for `configs/gpt1_data.yaml`. The kept tokens are padded with `<|pad|>` (id 50257) out to the full context.
-3. `VQVAE.encode` quantizes that padded window. Chat keeps only level 0. On both shipped square schedules level 0 is a single code.
-4. The prefix is the first `prefix_len` prompt tokens, or `<|endoftext|>` when the line encodes to nothing. Further tokens in the line are not a prefix.
-5. `NextConceptGenerator.generate` samples levels 1..K-1 from that level-0 code and that prefix. `temperature` 0 is argmax. `top_k` 0 and `top_p` 1 leave the distribution untruncated.
-6. `decode_logits(...).argmax` and `pretok.decode` turn the whole code grid into text. Pad and end-of-text ids are removed.
+1. GPT-2 BPE encodes the line. A leading space is part of the text; GPT-2 BPE keeps it. `"How are you?"` is four tokens: `How`, ` are`, ` you`, `?` (ids 2437, 389, 345, 30).
+2. If that list is longer than the context, the first `context_length` tokens are kept. The context is 512 for `configs/target.yaml` and 32 for `configs/gpt1_data.yaml`.
+3. If it is shorter, `<|endoftext|>` is appended and that block is repeated until the context is full. The encoded window then contains no `<|pad|>`. Training windows are slices of real tokens; a short paragraph is packed with what follows it, and pad is only a corpus tail. Leaving 508 pad positions makes level 0 the pad code. On the average-pool cascade this quantizer is initialized with, a 4-token line padded to 512 has cosine about 0.999992 with an all-pad window, and greedy decode of that code repeats a few frequent words.
+4. `VQVAE.encode` quantizes the packed window. Chat keeps only level 0. On both shipped square schedules that is one code, and it now depends on every token in the line, not only the first and not on pad.
+5. The generator prefix is `<|endoftext|>` (id 50256), repeated `prefix_len` times. Both shipped configs set `prefix_len` to 1. That slot is the prefix used when these weights are trained. It is an embedding lookup with no position added. The prompt does not go there: one token cannot hold the question, and a content token in a slot trained on end-of-text is the wrong condition.
+6. `NextConceptGenerator.generate` samples levels 1..K-1 from that level-0 code and the end-of-text prefix. `temperature` 0 is argmax. `top_k` 0 and `top_p` 1 leave the distribution untruncated.
+7. `decode_logits(...).argmax` and `pretok.decode` turn the code grid into text. Pad and end-of-text ids are removed.
 
-The printed reply is that one window. It is not the next sentence after the prompt. A short prompt is mostly padding, so level 0 is one coarse code of a nearly empty window. The previous reply is not fed back. There is no multi-turn token cache and no long-context continuation.
+The printed reply is that one window. It is conditioned on the coarse code of the packed prompt. It is not an answer to the question, and it is not the next sentence after the prompt. The previous reply is not fed back. There is no multi-turn token cache and no long-context continuation.
 
-The evaluator's qualitative hook is a different path: it draws level 0 from a train-set unigram and does not encode the prompt. Chat encodes the prompt because this command has no packed cache.
+stderr reports `encoded_pad`, `repeated`, and `prompt_tokens`. A short question should show `encoded_pad=0` and `repeated=yes`. `prefix` should be `50256`, not the first prompt token.
+
+The evaluator's qualitative hook is a different path: it draws level 0 from a train-set unigram and does not encode the prompt. Chat has no packed cache, so it builds the level-0 code by encoding a window filled with the prompt.
 
 ## Weights
 

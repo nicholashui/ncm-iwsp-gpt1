@@ -1,10 +1,12 @@
 """One-window text decode for NCM-iWSP-GPT1.
 
 This is not a causal language model. ``predict_level0`` is false, so level 0
-is not a generator target. Shipped configs set ``prefix_len`` to 1, so
-``NextConceptGenerator.generate`` reads at most one raw token. A turn encodes
-the prompt padded out to the full context, keeps that level-0 code, samples
-the finer codes, and decodes one window.
+is not a generator target. Shipped configs set ``prefix_len`` to 1, and the
+weights were trained with that slot set to ``<|endoftext|>``. A short prompt
+is repeated, with end-of-text between copies, until the context is full.
+``VQVAE.encode`` then sees prompt tokens rather than a pad-filled window.
+The generator samples the finer codes from that level-0 code and the decoder
+emits one window.
 """
 
 from __future__ import annotations
@@ -28,19 +30,24 @@ Decode one text window with NCM-iWSP-GPT1.
 
 This is not a causal language model and not ChatGPT-style continuation.
 predict_level0 is false, so level 0 is not a generator target. The shipped
-configs set prefix_len to 1, so the generator reads at most one raw token
-(an embedding lookup, with no position added).
+configs set prefix_len to 1. That one slot is <|endoftext|>, the prefix the
+generator was trained with. It is an embedding lookup with no position added.
+The prompt is not placed in that slot.
 
-Each turn encodes the line with GPT-2 BPE, pads it with <|pad|> out to the
-full context (512 for configs/target.yaml, 32 for configs/gpt1_data.yaml),
-and keeps only level 0 from VQVAE.encode. On both shipped schedules that is
-a single code. NextConceptGenerator.generate samples every finer level.
-The VQ-VAE decoder then turns the whole code grid into one window of tokens.
-Pad and end-of-text ids are stripped before printing. The reply is that
-window. It is not the next sentence after the prompt. A short prompt is
-mostly padding, so level 0 is one coarse code of the padded window. Turns
-are independent: the previous reply is not fed back, and there is no
-long-context token continuation.
+A short line is not padded out to the context. Padding a 4-token question
+to 512 makes level 0 the same code as an all-pad window, and greedy decode
+of that code collapses. The line is encoded with GPT-2 BPE, an end-of-text
+token is appended, and that block is repeated until the context is full
+(512 for configs/target.yaml, 32 for configs/gpt1_data.yaml). VQVAE.encode
+runs on that window. Chat keeps only level 0, one code on both shipped
+schedules. NextConceptGenerator.generate samples every finer level from
+that code and the end-of-text prefix. The VQ-VAE decoder then turns the
+code grid into one window. Pad and end-of-text ids are stripped before
+printing.
+
+The reply is that window, conditioned on the coarse code of the packed
+prompt. It is not an answer to the question and not token continuation.
+Turns are independent: the previous reply is not fed back.
 
 Type a line and press Enter. Quit with quit, exit, /quit, or /exit.
 Ctrl-D also quits. --prompt runs one turn and prints the decoded text on
@@ -84,13 +91,17 @@ class ChatSession:
         """Encode ``text``, sample finer codes, and decode one window."""
         if not isinstance(text, str):
             raise ChatError("prompt must be a string")
-        tokens, prefix, info = _prompt_tensors(
-            self.pretok,
-            text,
-            self.context_length,
-            self.prefix_len,
-            self.device,
-        )
+        packed = pack_prompt_window(self.pretok, text, self.context_length)
+        prefix_len = self.prefix_len
+        if prefix_len < 0:
+            raise ChatError("prefix_len must be >= 0")
+        # Training feeds this slot a constant end-of-text id, not a content token.
+        prefix_ids = [int(self.pretok.eos_token_id)] * prefix_len
+        tokens = torch.tensor([packed["window_ids"]], dtype=torch.long, device=self.device)
+        if prefix_len:
+            prefix = torch.tensor([prefix_ids], dtype=torch.long, device=self.device)
+        else:
+            prefix = torch.empty(1, 0, dtype=torch.long, device=self.device)
         with torch.no_grad():
             indices = self.vqvae.encode(tokens)
             level0 = indices[:, : self.level0_len]
@@ -102,9 +113,11 @@ class ChatSession:
                 top_p=self.top_p,
             )
             decoded_ids = self.vqvae.decode_logits(codes).argmax(dim=-1)[0]
-        info["text"] = self.pretok.decode(decoded_ids, skip_special_tokens=True)
-        info["level0"] = [int(value) for value in level0[0].tolist()]
-        return info
+        packed["prefix_ids"] = prefix_ids
+        packed["prefix_len"] = prefix_len
+        packed["text"] = self.pretok.decode(decoded_ids, skip_special_tokens=True)
+        packed["level0"] = [int(value) for value in level0[0].tolist()]
+        return packed
 
 
 def is_quit(text: str) -> bool:
@@ -160,9 +173,10 @@ def startup_message(session: ChatSession) -> str:
         (
             f"{session.config_name}: context {session.context_length}, "
             f"prefix_len {session.prefix_len}, device {session.device}. "
-            "Not a causal LM. Level 0 is encoded from the padded prompt; "
-            "finer codes are sampled and decoded as one window. "
-            "The previous reply is not used."
+            "Not a causal LM. A short prompt is repeated with end-of-text "
+            "between copies so level 0 is not a pad code. The generator "
+            "prefix is end-of-text. Finer codes are sampled and decoded as "
+            "one window. The previous reply is not used."
         ),
         (
             f"temperature={session.temperature:g} top_k={session.top_k} "
@@ -183,10 +197,12 @@ def format_note(result: dict) -> str:
     level0 = ",".join(str(value) for value in result["level0"])
     prefix = ",".join(str(value) for value in result["prefix_ids"])
     truncated = "yes" if result["truncated"] else "no"
+    repeated = "yes" if result["repeated"] else "no"
     return (
         f"level0={level0} prefix={prefix} "
-        f"prompt_tokens={result['prompt_tokens']}/{result['context_length']} "
-        f"truncated={truncated}"
+        f"prompt_tokens={result['prompt_tokens']} "
+        f"encoded_pad={result['encoded_pad']} "
+        f"repeated={repeated} truncated={truncated}"
     )
 
 
@@ -309,29 +325,49 @@ class _Prepared:
         _load_module(generator, self.generator_state, "generator")
 
 
-def _prompt_tensors(pretok, text, context_length, prefix_len, device):
-    ids = pretok.encode(text)
-    truncated = len(ids) > int(context_length)
-    if truncated:
-        ids = ids[: int(context_length)]
-    prefix_len = int(prefix_len)
-    if prefix_len < 0:
-        raise ChatError("prefix_len must be >= 0")
-    if not ids:
-        prefix_ids = [int(pretok.eos_token_id)] * prefix_len
+def pack_prompt_window(pretok, text: str, context_length: int) -> dict:
+    """Fill one context with the prompt, without a pad tail.
+
+    Training windows are slices of real tokens. A short paragraph is
+    concatenated with what follows it; only a corpus tail is padded.
+    Left-aligning a 4-token line and filling the other 508 positions with
+    ``<|pad|>`` makes the level-0 vector match an all-pad window (cosine
+    about 1 under the average-pool cascade this quantizer starts from), so
+    the generator conditions on the pad code and greedy decode repeats a
+    few frequent words.
+
+    A short line is followed by end-of-text and that block is repeated to
+    the context length. A line that is already longer than the context is
+    truncated to the first ``context_length`` tokens.
+    """
+    if not isinstance(text, str):
+        raise ChatError("prompt must be a string")
+    context_length = int(context_length)
+    if context_length < 1:
+        raise ChatError("context_length must be positive")
+    ids = list(pretok.encode(text))
+    truncated = len(ids) > context_length
+    kept = ids[:context_length]
+    eos = int(pretok.eos_token_id)
+    pad = int(pretok.pad_token_id)
+    repeated = len(kept) < context_length
+    if not repeated:
+        window = list(kept)
     else:
-        prefix_ids = (list(ids) + [int(pretok.pad_token_id)] * prefix_len)[:prefix_len]
-    window = list(ids) + [int(pretok.pad_token_id)] * (int(context_length) - len(ids))
-    tokens = torch.tensor([window], dtype=torch.long, device=device)
-    prefix = torch.tensor([prefix_ids], dtype=torch.long, device=device)
-    info = {
-        "prefix_ids": prefix_ids,
+        unit = (list(kept) + [eos]) if kept else [eos]
+        window = []
+        while len(window) < context_length:
+            window.extend(unit)
+        window = window[:context_length]
+    return {
+        "window_ids": window,
+        "prompt_ids": kept,
         "truncated": bool(truncated),
-        "prompt_tokens": len(ids),
-        "context_length": int(context_length),
-        "prefix_len": prefix_len,
+        "repeated": bool(repeated),
+        "prompt_tokens": len(kept),
+        "encoded_pad": sum(token == pad for token in window),
+        "context_length": context_length,
     }
-    return tokens, prefix, info
 
 
 def _check_sampling(temperature, top_k, top_p, seed) -> None:

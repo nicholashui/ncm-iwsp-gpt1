@@ -5,10 +5,11 @@ import argparse
 import pytest
 import torch
 
-from ncm_iwsp_gpt1.chat import ChatError, is_quit, open_session
+from ncm_iwsp_gpt1.chat import ChatError, is_quit, open_session, pack_prompt_window
 from ncm_iwsp_gpt1.cli import build_parser, main
 from ncm_iwsp_gpt1.config import load_config
 from ncm_iwsp_gpt1.convert import FORMAT_NAME
+from ncm_iwsp_gpt1.pretok import GPT2BPE
 
 
 def _cfg():
@@ -172,20 +173,45 @@ def test_finetune_file_is_not_a_converted_checkpoint(tmp_path):
         open_session(_cfg(), device="cpu", checkpoint=path)
 
 
+def test_short_prompt_window_is_not_pad_or_first_token():
+    """Context 512, no modules. This is the shape that collapsed on NicNicNic."""
+    pretok = GPT2BPE()
+    text = "How are you?"
+    ids = pretok.encode(text)
+    assert ids == [2437, 389, 345, 30]
+    info = pack_prompt_window(pretok, text, 512)
+    window = info["window_ids"]
+    assert info["prompt_tokens"] == 4
+    assert info["repeated"] is True
+    assert info["truncated"] is False
+    assert info["encoded_pad"] == 0
+    assert len(window) == 512
+    assert window[:5] == ids + [pretok.eos_token_id]
+    assert all(token in window for token in ids)
+    assert window.count(ids[0]) != 512
+    content = sum(token not in (pretok.pad_token_id, pretok.eos_token_id) for token in window)
+    assert content > 512 // 2
+    assert window[4] != pretok.pad_token_id
+
+
 def test_reply_encodes_level0_and_decodes():
     session = open_session(_cfg(), device="cpu", temperature=0.0, top_k=0, top_p=1.0, seed=0)
-    text = "The cat sat"
+    text = "How are you?"
     out = session.reply(text)
     ids = session.pretok.encode(text)
     assert out["prefix_len"] == 1
-    assert out["prefix_ids"] == [ids[0]]
+    assert out["prefix_ids"] == [session.pretok.eos_token_id]
     assert out["truncated"] is False
+    assert out["repeated"] is True
     assert out["prompt_tokens"] == len(ids)
-    assert len(ids) < session.context_length
-    window = ids + [session.pretok.pad_token_id] * (session.context_length - len(ids))
-    tokens = torch.tensor([window], dtype=torch.long)
+    assert out["encoded_pad"] == 0
+    assert out["window_ids"][: len(ids) + 1] == ids + [session.pretok.eos_token_id]
+    assert all(token in out["window_ids"] for token in ids)
+    tokens = torch.tensor([out["window_ids"]], dtype=torch.long)
+    pad_row = torch.full((1, session.context_length), session.pretok.pad_token_id, dtype=torch.long)
     with torch.no_grad():
         indices = session.vqvae.encode(tokens)
+        pad_level0 = session.vqvae.encode(pad_row)[0, :1].tolist()
         prefix = torch.tensor([out["prefix_ids"]], dtype=torch.long)
         codes = session.generator.generate(indices[:, :1], prefix, temperature=0.0, top_k=0, top_p=1.0)
         decoded = session.pretok.decode(
@@ -193,12 +219,16 @@ def test_reply_encodes_level0_and_decodes():
             skip_special_tokens=True,
         )
     assert out["level0"] == indices[0, :1].tolist()
+    assert out["level0"] != pad_level0
+    assert out["level0"] != session.reply("a")["level0"]
     assert codes.shape[1] == sum(session.vqvae.vq.levels)
     assert out["text"] == decoded
     assert isinstance(out["text"], str)
     empty = session.reply("")
     assert empty["prefix_ids"] == [session.pretok.eos_token_id]
     assert empty["prompt_tokens"] == 0
+    assert empty["encoded_pad"] == 0
+    assert empty["window_ids"] == [session.pretok.eos_token_id] * session.context_length
 
 
 def test_long_prompt_is_truncated_to_context():
@@ -208,11 +238,13 @@ def test_long_prompt_is_truncated_to_context():
     assert len(ids) > session.context_length
     out = session.reply(text)
     assert out["truncated"] is True
+    assert out["repeated"] is False
+    assert out["encoded_pad"] == 0
     assert out["prompt_tokens"] == session.context_length
-    assert out["prefix_ids"] == [ids[0]]
-    window = ids[: session.context_length]
+    assert out["prefix_ids"] == [session.pretok.eos_token_id]
+    assert out["window_ids"] == ids[: session.context_length]
     with torch.no_grad():
-        level0 = session.vqvae.encode(torch.tensor([window], dtype=torch.long))[0, :1].tolist()
+        level0 = session.vqvae.encode(torch.tensor([out["window_ids"]], dtype=torch.long))[0, :1].tolist()
     assert out["level0"] == level0
 
 

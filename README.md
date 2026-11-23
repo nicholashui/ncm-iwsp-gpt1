@@ -102,9 +102,9 @@ python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
 
 ## 文字對話
 
-`python -m ncm_iwsp_gpt1 chat` 把一段文字編成一個 window。它不是 causal LM，也不是 NCM-GPT1。`predict_level0` 是 false，level 0 不是 generator 的目標。出廠 config 的 `prefix_len` 是 1，所以 generator 只讀一個 raw token 的 embedding，不加 position。
+`python -m ncm_iwsp_gpt1 chat` 把一段文字編成一個 window。它不是 causal LM，也不是 NCM-GPT1。`predict_level0` 是 false，level 0 不是 generator 的目標。出廠 config 的 `prefix_len` 是 1，那個位置是訓練時用的 `<|endoftext|>`，不是提示的第一個 token。
 
-每一輪用 GPT-2 BPE 編碼，不足 context 的位置補 `<|pad|>`（target 512，runnable 32），`VQVAE.encode` 之後只留下 level 0（出廠 schedule 上是一個 code）。較細的 level 由 `NextConceptGenerator.generate` 抽樣，再 `decode_logits(...).argmax` 和 `pretok.decode`。印出來的是這一整個 window，不是接在提示後面的下一句。短句幾乎全是 pad。上一輪的輸出不會再送進去。限制與三種權重格式寫在 [`docs/chat.md`](docs/chat.md)，`--help` 裡也有同樣的說明。
+短句不要用 `<|pad|>` 補到 context。四個 token 後面補 508 個 pad，level 0 會和全 pad 的 window 落到同一個 code，greedy decode 就會重複幾個高頻詞。正確的做法是在提示後面加 `<|endoftext|>`，再把這一段重複到 context 滿（target 512，runnable 32），然後 `VQVAE.encode` 只留下 level 0。較細的 level 由 `NextConceptGenerator.generate` 抽樣，再 `decode_logits(...).argmax` 和 `pretok.decode`。印出來的是這一個 window 的解碼，由打包後提示的粗碼決定。它不是問題的回答，上一輪也不會再送進去。細節在 [`docs/chat.md`](docs/chat.md)，`--help` 裡也有同樣的說明。
 
 v3 權重不在 git 裡。`tokenizer.pt`、`generator.pt`、微調 `latest.pt` 也都沒有提交。NicNicNic 上已轉好的 init 例路徑是 `E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt` 和 `generator.pt`。微調檔要自己下載之後再指到 `--finetune`；下面的 `E:\Project\ncm-iwsp-gpt1-finetune\latest.pt` 只是例路徑。`latest.pt` 的格式是 `ncm-iwsp-gpt1-finetune`，`model` 載入 generator，optimizer 略過。
 
@@ -129,7 +129,7 @@ cd /d e:\Project\ncm-iwsp-gpt1
 
 `--prompt` 把解碼文字印到 stdout。不加 `--prompt` 就是 stdin 迴圈：一行進、一行出，`quit` 或 `exit` 離開。沒有權重時用 config 的 seed 初始化，並在 stderr 說明那不是 v3。
 
-`chat` encodes a padded prompt into one level-0 code, samples the finer codes, and decodes a single window. See [`docs/chat.md`](docs/chat.md). v3 weights are not in git.
+`chat` repeats a short prompt with end-of-text between copies, encodes that full window to one level-0 code, samples the finer codes, and decodes a single window. The generator prefix stays `<|endoftext|>`. See [`docs/chat.md`](docs/chat.md). v3 weights are not in git.
 
 ## 安裝
 
@@ -264,7 +264,7 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 | `ncm_iwsp_gpt1/models/` | VQ-VAE 與 untied generator；finetune 會對 generator 開 checkpoint |
 | `ncm_iwsp_gpt1/writers/stub.py` | Writer 應該只改這個檔的複本 |
 | `ncm_iwsp_gpt1/evaluate.py` | 固定的指標 |
-| `ncm_iwsp_gpt1/chat.py` | 互動與單次解碼；level 0 來自補齊後的提示 |
+| `ncm_iwsp_gpt1/chat.py` | 互動與單次解碼；短提示重複到 context 後再取 level 0 |
 | `ncm_iwsp_gpt1/audit.py` | 訓練、下載、hidden 洩漏 |
 | `ncm_iwsp_gpt1/loop.py` | propose / write / eval / audit |
 | `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert`、`finetune`、`chat` |
