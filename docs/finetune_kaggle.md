@@ -6,6 +6,8 @@ This is a separate command from the writer loop. The writer loop still does not 
 
 No command in this repository submits a Kaggle job. Nicholas confirms the dataset list before he submits the new notebook himself. Do not open or edit the kernel `nicholashuihk/ncm-gpt-1-train`.
 
+Logs and figures from kernel version 3 are in [`artifacts/kaggle-finetune-v3/`](../artifacts/kaggle-finetune-v3/).
+
 ## What the loss is
 
 Training minimizes next-code cross-entropy on levels `1 .. K-1`. Level 0 is encoded and used as conditioning. It is not a generator target.

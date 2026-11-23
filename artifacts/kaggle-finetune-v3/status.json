@@ -1,0 +1,8 @@
+{
+  "step": 53232,
+  "max_steps": 100000,
+  "finished": false,
+  "stage": "ncm-iwsp-gpt1-finetune",
+  "loss_comparable_to_alpha0": true,
+  "loss_note": "Optimized loss is the alpha=0 mean of per-position cross-entropy (every predicted code cell has the same weight). mid_aux is 0. ce_first, ce_mid, and ce_last are the raw means of the first, middle, and last predicted levels and do not include a mid_aux term. NCM-GPT1 v10 logged a different scalar once alpha or mid_aux left 0 (alpha 0.5, and mid_aux 0.5 on later kernels). Compare those runs on ce_first, ce_mid, and ce_last."
+}

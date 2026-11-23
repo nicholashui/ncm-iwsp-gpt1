@@ -10,6 +10,9 @@ cache/
 runs/
 *.pt
 *.jsonl
+# Recorded Kaggle fine-tune v3 metric logs (not a corpus dump).
+!artifacts/kaggle-finetune-v3/train_log.jsonl
+!artifacts/kaggle-finetune-v3/val_log.jsonl
 *.arrow
 *.parquet
 *.bin
