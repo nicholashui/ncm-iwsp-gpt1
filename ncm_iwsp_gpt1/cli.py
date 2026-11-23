@@ -1,4 +1,4 @@
-"""Command line for packing, counting, evaluation, and the local dry loop."""
+"""Command line for packing, counting, evaluation, chat, and the local dry loop."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from pathlib import Path
 
 from ncm_iwsp_gpt1.audit import AuditError
 from ncm_iwsp_gpt1.build import build_models, parameter_report
+from ncm_iwsp_gpt1.chat import CHAT_DESCRIPTION, ChatError, open_session, run_interactive, run_prompt
 from ncm_iwsp_gpt1.config import load_config
-from ncm_iwsp_gpt1.convert import ConvertError, convert_files, load_converted_checkpoint
+from ncm_iwsp_gpt1.convert import FORMAT_NAME, ConvertError, convert_files, load_converted_checkpoint
 from ncm_iwsp_gpt1.evaluate import evaluate_windows
 from ncm_iwsp_gpt1.finetune import FinetuneError, describe_run, run_finetune
 from ncm_iwsp_gpt1.loop import load_writer, run_dry_loop
@@ -222,12 +223,38 @@ def _cmd_convert(args) -> int:
     return 0
 
 
+def _cmd_chat(args) -> int:
+    cfg = load_config(args.config)
+    try:
+        session = open_session(
+            cfg,
+            device=args.device,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            seed=args.seed,
+            checkpoint=args.checkpoint,
+            tokenizer_path=args.tokenizer,
+            generator_path=args.generator,
+            finetune_path=args.finetune,
+        )
+    except (ChatError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    try:
+        if args.prompt is not None:
+            return run_prompt(session, args.prompt)
+        return run_interactive(session)
+    except ChatError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ncm_iwsp_gpt1",
         description=(
             "NCM-iWSP-GPT1. The writer loop scores closed-form weights. "
-            "finetune is a separate gradient run of the untied generator."
+            "finetune is a separate gradient run of the untied generator. "
+            "chat decodes one window from a level-0 code and a one-token prefix."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -303,6 +330,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     convert.add_argument("--device", default="cpu", help="device for --smoke-forward (cpu, cuda, or auto)")
     convert.set_defaults(func=_cmd_convert)
+
+    chat = sub.add_parser(
+        "chat",
+        help="decode one window from a level-0 code and a one-token prefix",
+        description=CHAT_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    chat.add_argument("--config", default="configs/target.yaml")
+    chat.add_argument("--device", default="auto", help="auto (CUDA if available), cuda, or cpu")
+    chat.add_argument("--temperature", type=float, default=0.0, help="0 is argmax")
+    chat.add_argument("--top-k", type=int, default=0, help="0 disables top-k")
+    chat.add_argument("--top-p", type=float, default=1.0, help="1 disables nucleus sampling")
+    chat.add_argument("--seed", type=int, default=0, help="sampling seed; initialization still uses the config seed")
+    chat.add_argument(
+        "--prompt",
+        default=None,
+        help="decode this string and exit; omit it for the stdin loop",
+    )
+    chat.add_argument(
+        "--checkpoint",
+        default=None,
+        help=f"single converted file (format {FORMAT_NAME})",
+    )
+    chat.add_argument("--tokenizer", default=None, help="frozen tokenizer.pt ({model, step, converted_from, ...})")
+    chat.add_argument(
+        "--generator",
+        default=None,
+        help="converted generator.pt ({model, step, converted_from, ...}); not a tied-head trainer file",
+    )
+    chat.add_argument(
+        "--finetune",
+        default=None,
+        help="latest.pt with format ncm-iwsp-gpt1-finetune; optimizer state is ignored",
+    )
+    chat.set_defaults(func=_cmd_chat)
 
     finetune = sub.add_parser(
         "finetune",

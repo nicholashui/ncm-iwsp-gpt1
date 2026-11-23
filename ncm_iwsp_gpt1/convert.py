@@ -378,9 +378,14 @@ def convert_files(
     return report
 
 
-def load_converted_checkpoint(path: str | Path, vqvae, generator) -> dict:
-    """Load a file written by :func:`convert_files` into an already built pair."""
-    blob = torch.load(Path(path), map_location="cpu", weights_only=False)
+def load_converted_checkpoint(path: str | Path, vqvae, generator, blob=None) -> dict:
+    """Load a file written by :func:`convert_files` into an already built pair.
+
+    Pass ``blob`` when the caller already read the file, so a large checkpoint
+    is not loaded twice. The acceptance rule is otherwise unchanged.
+    """
+    if blob is None:
+        blob = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(blob, dict) or blob.get("format") != FORMAT_NAME:
         raise ConvertError(
             f"{path} is not an {FORMAT_NAME} checkpoint. "
