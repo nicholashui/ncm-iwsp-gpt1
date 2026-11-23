@@ -59,26 +59,32 @@ def test_rejections(tmp_path):
         assert problems, name
 
 
-_FINETUNE = Path("ncm_iwsp_gpt1/finetune.py")
+# Gradient code is allowed only in these two modules. finetune updates the
+# untied generator. prefix_level0 updates the separate level-0 head. Writers,
+# the evaluator, and the chat path do not call backward.
+_TRAINING_MODULES = (
+    "ncm_iwsp_gpt1/finetune.py",
+    "ncm_iwsp_gpt1/prefix_level0.py",
+)
 
 
 def test_package_sources_do_not_train():
     root = Path("ncm_iwsp_gpt1")
     for path in root.rglob("*.py"):
-        if path.as_posix() == _FINETUNE.as_posix():
+        if path.as_posix() in _TRAINING_MODULES:
             continue
         code = code_only(path.read_text(encoding="utf-8"))
         for banned in (".backward(", "torch.optim", "sklearn", "AdamW", "train_tokenizer", "train_generator"):
             assert banned not in code, f"{path} contains {banned}"
 
 
-def test_finetune_is_the_only_optimizer_module():
+def test_training_modules_are_explicit():
     hits = []
     for path in Path("ncm_iwsp_gpt1").rglob("*.py"):
         code = code_only(path.read_text(encoding="utf-8"))
         if any(bit in code for bit in (".backward(", "torch.optim", "AdamW")):
             hits.append(path.as_posix())
-    assert hits == ["ncm_iwsp_gpt1/finetune.py"]
+    assert sorted(hits) == sorted(_TRAINING_MODULES)
     for rel in (
         "ncm_iwsp_gpt1/loop.py",
         "ncm_iwsp_gpt1/evaluate.py",
