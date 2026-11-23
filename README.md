@@ -102,34 +102,29 @@ python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
 
 ## 文字對話
 
-`python -m ncm_iwsp_gpt1 chat` 把一段文字編成一個 window。它不是 causal LM，也不是 NCM-GPT1。`predict_level0` 是 false，level 0 不是 generator 的目標。出廠 config 的 `prefix_len` 是 1，那個位置是訓練時用的 `<|endoftext|>`，不是提示的第一個 token。
+`python -m ncm_iwsp_gpt1 chat` 把短提示接成一個 window 的延續。它不是 causal LM，也不是聊天機器人，也不是 NCM-GPT1。`predict_level0` 維持 false，level 0 不是 generator 的目標。`prefix_len` 維持 1，那個位置仍是 `<|endoftext|>`，用來對上現有權重。提示詞不放進這個前綴。
 
-短句不要用 `<|pad|>` 補到 context。四個 token 後面補 508 個 pad，level 0 會和全 pad 的 window 落到同一個 code，greedy decode 就會重複幾個高頻詞。正確的做法是在提示後面加 `<|endoftext|>`，再把這一段重複到 context 滿（target 512，runnable 32），然後 `VQVAE.encode` 只留下 level 0。較細的 level 由 `NextConceptGenerator.generate` 抽樣，再 `decode_logits(...).argmax` 和 `pretok.decode`。印出來的是這一個 window 的解碼，由打包後提示的粗碼決定。它不是問題的回答，上一輪也不會再送進去。細節在 [`docs/chat.md`](docs/chat.md)，`--help` 裡也有同樣的說明。
+預設要一個前綴 level-0 頭（`--prefix-head`）。頭讀真實提示的 `encoder.wte`，抽出一個 level-0，不再把短句重複填滿 context。細碼仍由凍結的 generator 抽出再解碼。stderr 印 `level0_source=prefix_head`。沒有這個 checkpoint 就停下來，不會退回重複打包。對照組要寫明：`--level0-source packed`，或 `--level0-source unigram --packed packed_windows.pt`。
 
-v3 權重不在 git 裡。`tokenizer.pt`、`generator.pt`、微調 `latest.pt` 也都沒有提交。NicNicNic 上已轉好的 init 例路徑是 `E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt` 和 `generator.pt`。微調檔要自己下載之後再指到 `--finetune`；下面的 `E:\Project\ncm-iwsp-gpt1-finetune\latest.pt` 只是例路徑。`latest.pt` 的格式是 `ncm-iwsp-gpt1-finetune`，`model` 載入 generator，optimizer 略過。
+這是延續，不是問答。「How are you?」不是要回「I'm fine」。訓練指令是 `python -m ncm_iwsp_gpt1 train-prefix-level0`，只更新這個頭。`packed_windows.pt` 不在 repo 裡，這裡不啟動長訓練，也不提交 Kaggle。細節在 [`docs/chat.md`](docs/chat.md)。
 
-Windows，checkout 在 `e:\Project\ncm-iwsp-gpt1`：
+v3 權重和前綴頭都不在 git 裡。下面的路徑只是例子。
 
 ```bat
 cd /d e:\Project\ncm-iwsp-gpt1
 .venv\Scripts\python.exe -m ncm_iwsp_gpt1 chat --help
 
-.venv\Scripts\python.exe -m ncm_iwsp_gpt1 chat ^
-  --config configs\target.yaml ^
-  --device auto ^
-  --tokenizer E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt ^
-  --generator E:\Project\ncm-iwsp-gpt1-init\generator.pt
+.venv\Scripts\python.exe -m ncm_iwsp_gpt1 train-prefix-level0 --config configs\target.yaml --dry-plan
 
 .venv\Scripts\python.exe -m ncm_iwsp_gpt1 chat ^
   --config configs\target.yaml ^
   --tokenizer E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt ^
-  --finetune E:\Project\ncm-iwsp-gpt1-finetune\latest.pt ^
-  --prompt "Hello"
+  --finetune E:\Project\ncm-iwsp-gpt1-finetune-v3\latest.pt ^
+  --prefix-head E:\Project\ncm-iwsp-gpt1-prefix-level0\prefix_level0.pt ^
+  --prompt "The cat sat"
 ```
 
-`--prompt` 把解碼文字印到 stdout。不加 `--prompt` 就是 stdin 迴圈：一行進、一行出，`quit` 或 `exit` 離開。沒有權重時用 config 的 seed 初始化，並在 stderr 說明那不是 v3。
-
-`chat` repeats a short prompt with end-of-text between copies, encodes that full window to one level-0 code, samples the finer codes, and decodes a single window. The generator prefix stays `<|endoftext|>`. See [`docs/chat.md`](docs/chat.md). v3 weights are not in git.
+`--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The generator prefix stays `<|endoftext|>`. See [`docs/chat.md`](docs/chat.md). v3 weights and the prefix head are not in git.
 
 ## 安裝
 
@@ -251,7 +246,7 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 
 煙霧測試就是安裝一節裡的 `pytest`：Windows 用 `.venv\Scripts\python.exe -m pytest`，POSIX 用 `.venv/bin/python -m pytest`。GitHub Actions 在乾淨的 runner 上直接裝 CPU 版 PyTorch，不使用這份本地 `.venv`。
 
-涵蓋：GPT-2 BPE 把類似 BookCorpus 的短文打成 window（含長度 512）、文件級 hash split 的隔離、兩份 config 載入、上面的參數數量（runnable 與 target 都會在 CPU 上實例化）、audit 拒絕 backward / Adam / AdamW / 權重下載 / hidden 洩漏、以及合成 packed window 上的 forward。GitHub Actions 用 CPU 版 PyTorch 跑同一套。測試只用合成句子，不包含真的 BookCorpus。
+涵蓋：GPT-2 BPE 把類似 BookCorpus 的短文打成 window（含長度 512）、文件級 hash split 的隔離、兩份 config 載入、上面的參數數量（runnable 與 target 都會在 CPU 上實例化）、audit 拒絕 backward / Adam / AdamW / 權重下載 / hidden 洩漏、合成 packed window 上的 forward，以及 prefix level-0 頭的形狀、一步訓練和 chat 接線。GitHub Actions 用 CPU 版 PyTorch 跑同一套。測試只用合成句子，不包含真的 BookCorpus。
 
 ## 目錄
 
@@ -264,15 +259,16 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 | `ncm_iwsp_gpt1/models/` | VQ-VAE 與 untied generator；finetune 會對 generator 開 checkpoint |
 | `ncm_iwsp_gpt1/writers/stub.py` | Writer 應該只改這個檔的複本 |
 | `ncm_iwsp_gpt1/evaluate.py` | 固定的指標 |
-| `ncm_iwsp_gpt1/chat.py` | 互動與單次解碼；短提示重複到 context 後再取 level 0 |
+| `ncm_iwsp_gpt1/prefix_level0.py` | 前綴 level-0 頭；只訓練這個頭，tokenizer 與 generator 凍結 |
+| `ncm_iwsp_gpt1/chat.py` | 用真實提示抽 level 0；packed 與 unigram 是明示對照 |
 | `ncm_iwsp_gpt1/audit.py` | 訓練、下載、hidden 洩漏 |
 | `ncm_iwsp_gpt1/loop.py` | propose / write / eval / audit |
-| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert`、`finetune`、`chat` |
+| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert`、`finetune`、`chat`、`train-prefix-level0` |
 | `ncm_iwsp_gpt1/convert.py` | 閉式複製 tokenizer / body，展開 tied head，丟棄 post-upsample |
 | `ncm_iwsp_gpt1/finetune.py` | 從已轉換 init 梯度更新 untied generator；tokenizer 凍結 |
 | `docs/convert_from_gradient_checkpoint.md` | 公式、caveat、NicNicNic 與 Kaggle 指令 |
 | `docs/finetune_kaggle.md` | 上傳 init、接上 `artifacts/packed_windows.pt`、T4 預設、loss 怎麼比 |
-| `docs/chat.md` | 為什麼 chat 只解一個 window，以及 Windows 上的權重路徑 |
+| `docs/chat.md` | 前綴頭延續、必要的 checkpoint、以及 packed / unigram 對照 |
 | `kaggle/convert_iwsp.py` | 新的 Kaggle notebook 用的轉換腳本，寫入 `/kaggle/working` |
 | `kaggle/convert_iwsp.ipynb` | 同一支腳本的 notebook 版，不提交 Kaggle job |
 | `kaggle/finetune_iwsp.py` | 新的微調腳本，只寫 `/kaggle/working`，需要 `--confirm` |

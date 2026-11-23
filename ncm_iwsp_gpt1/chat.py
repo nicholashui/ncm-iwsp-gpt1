@@ -1,12 +1,14 @@
-"""One-window text decode for NCM-iWSP-GPT1.
+"""One-window continuation for NCM-iWSP-GPT1.
 
-This is not a causal language model. ``predict_level0`` is false, so level 0
-is not a generator target. Shipped configs set ``prefix_len`` to 1, and the
-weights were trained with that slot set to ``<|endoftext|>``. A short prompt
-is repeated, with end-of-text between copies, until the context is full.
-``VQVAE.encode`` then sees prompt tokens rather than a pad-filled window.
-The generator samples the finer codes from that level-0 code and the decoder
-emits one window.
+This is not a causal language model and not a chatbot. ``predict_level0`` is
+false, so level 0 is not a generator target. Shipped configs keep
+``prefix_len`` at 1, and that slot stays ``<|endoftext|>`` so existing
+weights see the prefix they were trained with.
+
+The default path samples the single level-0 code from a prefix head on the
+real prompt tokens (``encoder.wte``, not a window filled by repeating the
+prompt). The generator then samples the finer codes. Packed-repeat encode
+and a train-set unigram are explicit baselines, not the fallback.
 """
 
 from __future__ import annotations
@@ -19,49 +21,73 @@ import torch
 from ncm_iwsp_gpt1.build import build_models, lock_for_eval
 from ncm_iwsp_gpt1.convert import FORMAT_NAME, ConvertError, load_converted_checkpoint
 from ncm_iwsp_gpt1.device import resolve_device
+from ncm_iwsp_gpt1.prefix_level0 import (
+    PREFIX_LEVEL0_FORMAT,
+    PrefixLevel0Error,
+    embed_prompt_tokens,
+    level0_code_counts,
+    load_prefix_head,
+    load_windows_for_level0,
+    prefix_blob_matches,
+    read_prefix_blob,
+    sample_logits,
+)
 
 FINETUNE_FORMAT = "ncm-iwsp-gpt1-finetune"
 QUIT_COMMANDS = frozenset({"quit", "exit", "/quit", "/exit"})
+LEVEL0_SOURCES = ("prefix_head", "packed", "unigram")
 _FOREIGN_BITS = ("post_upsample_convs.", ".proj.", "log_inv_T")
 _SKIP_META = frozenset({"model", "optimizer", "scaler", "tokenizer", "generator"})
+MISSING_PREFIX_HEAD = (
+    "No prefix-head checkpoint was given, so chat will not decode. "
+    f"Pass --prefix-head PATH (format {PREFIX_LEVEL0_FORMAT}) to sample "
+    "level 0 from the real prompt tokens. The prompt is not repeated to fill "
+    "the context. Packed-repeat encode is not the default. "
+    "For that previous path, pass --level0-source packed. "
+    "For a prompt-independent level-0 draw, pass --level0-source unigram --packed PATH."
+)
 
-CHAT_DESCRIPTION = """\
-Decode one text window with NCM-iWSP-GPT1.
+CHAT_DESCRIPTION = f"""\
+Continue one text window with NCM-iWSP-GPT1.
 
-This is not a causal language model and not ChatGPT-style continuation.
-predict_level0 is false, so level 0 is not a generator target. The shipped
-configs set prefix_len to 1. That one slot is <|endoftext|>, the prefix the
-generator was trained with. It is an embedding lookup with no position added.
-The prompt is not placed in that slot.
+This is not a causal language model and not ChatGPT. It continues a short
+prompt as one reconstructed window. It does not answer questions. predict_level0
+is false, so level 0 is not a generator target. The shipped configs set
+prefix_len to 1. That slot stays <|endoftext|>, the prefix the generator
+weights were trained with. The prompt is not placed in that slot.
 
-A short line is not padded out to the context. Padding a 4-token question
-to 512 makes level 0 the same code as an all-pad window, and greedy decode
-of that code collapses. The line is encoded with GPT-2 BPE, an end-of-text
-token is appended, and that block is repeated until the context is full
-(512 for configs/target.yaml, 32 for configs/gpt1_data.yaml). VQVAE.encode
-runs on that window. Chat keeps only level 0, one code on both shipped
-schedules. NextConceptGenerator.generate samples every finer level from
-that code and the end-of-text prefix. The VQ-VAE decoder then turns the
-code grid into one window. Pad and end-of-text ids are stripped before
-printing.
+The default path needs a prefix level-0 head (--prefix-head, format
+{PREFIX_LEVEL0_FORMAT}). The head reads the real prompt through the frozen
+tokenizer encoder.wte and samples one level-0 code. The line is not padded
+to the context and not repeated until the context is full. NextConceptGenerator.generate
+then samples the finer codes from that code and the end-of-text prefix.
+The VQ-VAE decoder turns the code grid into one window. stderr prints
+level0_source=prefix_head.
 
-The reply is that window, conditioned on the coarse code of the packed
-prompt. It is not an answer to the question and not token continuation.
-Turns are independent: the previous reply is not fed back.
+Without --prefix-head, chat stops. It does not silently encode a packed
+repeat of the prompt. Two comparison baselines are explicit:
+  --level0-source packed
+      previous path: append end-of-text and repeat that block to the context
+      (512 for configs/target.yaml, 32 for configs/gpt1_data.yaml), then
+      VQVAE.encode and keep level 0
+  --level0-source unigram --packed packed_windows.pt
+      draw level 0 from an add-one unigram of those windows. The prompt does
+      not choose the code. The generator prefix is still end-of-text.
 
-Type a line and press Enter. Quit with quit, exit, /quit, or /exit.
-Ctrl-D also quits. --prompt runs one turn and prints the decoded text on
-stdout. temperature 0 is argmax. top_k 0 and top_p 1 disable truncation.
+Turns are independent: the previous reply is not fed back. temperature 0 is
+argmax. top_k 0 and top_p 1 disable truncation. This is continuation, not a
+chatbot reply.
 
-Weights, including v3, are not in this git repository. Layouts loaded as-is:
+Weights, including v3 and the prefix head, are not in this git repository.
+Layouts loaded as-is:
   --checkpoint FILE
-      one file, format ncm-iwsp-gpt1-from-gradient-checkpoint
+      one file, format {FORMAT_NAME}
   --tokenizer tokenizer.pt --generator generator.pt
-      each blob is typically {model, step, converted_from, ...}
+      each blob is typically {{model, step, converted_from, ...}}
   --tokenizer tokenizer.pt --finetune latest.pt
       latest.pt format ncm-iwsp-gpt1-finetune; the model state dict is the
       generator and the optimizer is ignored
-With no weights, the seeded initialization is used and a warning is printed.
+Train the head with `python -m ncm_iwsp_gpt1 train-prefix-level0`.
 """
 
 
@@ -72,7 +98,23 @@ class ChatError(ValueError):
 class ChatSession:
     """Frozen tokenizer plus generator, ready to decode one window per turn."""
 
-    def __init__(self, pretok, vqvae, generator, device, temperature, top_k, top_p, weights_label, weights_detail, config_name):
+    def __init__(
+        self,
+        pretok,
+        vqvae,
+        generator,
+        device,
+        temperature,
+        top_k,
+        top_p,
+        weights_label,
+        weights_detail,
+        config_name,
+        level0_source,
+        prefix_head=None,
+        unigram_probs=None,
+        level0_detail="",
+    ):
         self.pretok = pretok
         self.vqvae = vqvae
         self.generator = generator
@@ -86,38 +128,72 @@ class ChatSession:
         self.context_length = int(vqvae.context_length)
         self.prefix_len = int(generator.prefix_len)
         self.level0_len = int(vqvae.vq.levels[0])
+        self.level0_source = str(level0_source)
+        self.prefix_head = prefix_head
+        self.unigram_probs = unigram_probs
+        self.level0_detail = str(level0_detail)
 
     def reply(self, text: str) -> dict:
-        """Encode ``text``, sample finer codes, and decode one window."""
+        """Sample level 0 for ``text``, then finer codes, and decode one window."""
         if not isinstance(text, str):
             raise ChatError("prompt must be a string")
-        packed = pack_prompt_window(self.pretok, text, self.context_length)
-        prefix_len = self.prefix_len
-        if prefix_len < 0:
-            raise ChatError("prefix_len must be >= 0")
-        # Training feeds this slot a constant end-of-text id, not a content token.
-        prefix_ids = [int(self.pretok.eos_token_id)] * prefix_len
-        tokens = torch.tensor([packed["window_ids"]], dtype=torch.long, device=self.device)
-        if prefix_len:
-            prefix = torch.tensor([prefix_ids], dtype=torch.long, device=self.device)
-        else:
-            prefix = torch.empty(1, 0, dtype=torch.long, device=self.device)
+        prefix_ids, prefix = _eos_prefix(self)
         with torch.no_grad():
-            indices = self.vqvae.encode(tokens)
-            level0 = indices[:, : self.level0_len]
-            codes = self.generator.generate(
-                level0,
-                prefix,
-                temperature=self.temperature,
-                top_k=self.top_k,
-                top_p=self.top_p,
-            )
-            decoded_ids = self.vqvae.decode_logits(codes).argmax(dim=-1)[0]
+            if self.level0_source == "packed":
+                packed = pack_prompt_window(self.pretok, text, self.context_length)
+                tokens = torch.tensor([packed["window_ids"]], dtype=torch.long, device=self.device)
+                level0 = self.vqvae.encode(tokens)[:, : self.level0_len]
+            elif self.level0_source == "prefix_head":
+                packed = real_prompt_tokens(self.pretok, text, self.context_length)
+                if packed["prompt_tokens"] < 1:
+                    raise ChatError(
+                        "the prefix head needs at least one prompt token. "
+                        "An empty line has no embedding to condition on."
+                    )
+                level0 = self._level0_from_head(packed["prompt_ids"])
+            elif self.level0_source == "unigram":
+                packed = real_prompt_tokens(self.pretok, text, self.context_length)
+                level0 = self._level0_from_unigram()
+            else:
+                raise ChatError(f"unknown level0_source {self.level0_source!r}")
+            decoded_ids = self._decode_ids(level0, prefix)
         packed["prefix_ids"] = prefix_ids
-        packed["prefix_len"] = prefix_len
+        packed["prefix_len"] = len(prefix_ids)
         packed["text"] = self.pretok.decode(decoded_ids, skip_special_tokens=True)
         packed["level0"] = [int(value) for value in level0[0].tolist()]
+        packed["level0_source"] = self.level0_source
         return packed
+
+    def _level0_from_head(self, prompt_ids: list[int]) -> torch.Tensor:
+        if self.prefix_head is None:
+            raise ChatError("prefix head is not loaded")
+        if self.level0_len != 1:
+            raise ChatError("the prefix head predicts a single level-0 code")
+        token_ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        embeddings = embed_prompt_tokens(self.vqvae.encoder.wte, token_ids)
+        lengths = torch.tensor([int(token_ids.shape[1])], dtype=torch.long, device=self.device)
+        logits = self.prefix_head(embeddings, lengths)
+        draw = sample_logits(logits, self.temperature, self.top_k, self.top_p)
+        return draw.reshape(1, self.level0_len)
+
+    def _level0_from_unigram(self) -> torch.Tensor:
+        if self.unigram_probs is None:
+            raise ChatError("unigram baseline has no level-0 counts")
+        if self.level0_len != 1:
+            raise ChatError("the unigram baseline draws a single level-0 code")
+        logits = torch.log(self.unigram_probs.clamp_min(1e-12)).view(1, -1)
+        draw = sample_logits(logits, self.temperature, self.top_k, self.top_p)
+        return draw.reshape(1, self.level0_len)
+
+    def _decode_ids(self, level0, prefix) -> torch.Tensor:
+        codes = self.generator.generate(
+            level0,
+            prefix,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+        )
+        return self.vqvae.decode_logits(codes).argmax(dim=-1)[0]
 
 
 def is_quit(text: str) -> bool:
@@ -135,9 +211,22 @@ def open_session(
     tokenizer_path: str | Path | None = None,
     generator_path: str | Path | None = None,
     finetune_path: str | Path | None = None,
+    prefix_head_path: str | Path | None = None,
+    level0_source: str = "prefix_head",
+    packed_path: str | Path | None = None,
+    unigram_max_windows: int = 256,
 ) -> ChatSession:
-    """Build the modules, optionally load weights, and move them to ``device``."""
+    """Build the modules, optionally load weights, and move them to ``device``.
+
+    The default ``level0_source`` is ``prefix_head``. That path refuses to
+    run until ``prefix_head_path`` is a real checkpoint. ``packed`` and
+    ``unigram`` are comparison baselines and must be requested by name.
+    """
     _check_sampling(temperature, top_k, top_p, seed)
+    _check_weight_flags(checkpoint, tokenizer_path, generator_path, finetune_path)
+    source, prefix_head_path, packed_path, head_blob = _check_level0_request(
+        cfg, prefix_head_path, level0_source, packed_path, unigram_max_windows
+    )
     resolved = resolve_device(device)
     prepared = prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path)
     pretok, vqvae, generator = build_models(cfg)
@@ -153,6 +242,44 @@ def open_session(
     lock_for_eval(generator)
     vqvae.to(resolved)
     generator.to(resolved)
+    prefix_head = None
+    unigram_probs = None
+    if source == "prefix_head":
+        try:
+            prefix_head = load_prefix_head(
+                head_blob,
+                int(cfg["tokenizer"]["embed_dim"]),
+                int(cfg["tokenizer"]["codebook_size"]),
+                int(cfg["tokenizer"]["context_length"]),
+            )
+        except PrefixLevel0Error as exc:
+            raise ChatError(str(exc)) from exc
+        lock_for_eval(prefix_head)
+        prefix_head.to(resolved)
+        step = _as_int(head_blob.get("step"))
+        level0_detail = f"loaded prefix head {prefix_head_path}"
+        if step is not None:
+            level0_detail += f" step={step}"
+    elif source == "unigram":
+        try:
+            windows = load_windows_for_level0(packed_path, int(vqvae.context_length))
+            counts = level0_code_counts(
+                vqvae,
+                windows,
+                max_windows=int(unigram_max_windows),
+                batch_size=8,
+            )
+        except PrefixLevel0Error as exc:
+            raise ChatError(str(exc)) from exc
+        probs = (counts + 1.0) / (counts.sum() + counts.numel())
+        unigram_probs = probs.to(device=resolved, dtype=torch.float32)
+        used = min(int(unigram_max_windows), int(windows.shape[0]))
+        level0_detail = f"unigram counts from {packed_path} windows={used}"
+    else:
+        level0_detail = (
+            "baseline level0_source=packed: end-of-text is appended and the "
+            "block is repeated to the context, then encoded. This is not the prefix head."
+        )
     torch.manual_seed(int(seed))
     return ChatSession(
         pretok,
@@ -165,6 +292,10 @@ def open_session(
         weights_label,
         weights_detail,
         cfg.get("name", ""),
+        source,
+        prefix_head,
+        unigram_probs,
+        level0_detail,
     )
 
 
@@ -173,11 +304,12 @@ def startup_message(session: ChatSession) -> str:
         (
             f"{session.config_name}: context {session.context_length}, "
             f"prefix_len {session.prefix_len}, device {session.device}. "
-            "Not a causal LM. A short prompt is repeated with end-of-text "
-            "between copies so level 0 is not a pad code. The generator "
-            "prefix is end-of-text. Finer codes are sampled and decoded as "
-            "one window. The previous reply is not used."
+            f"Not a causal LM. level0_source={session.level0_source}. "
+            "The generator prefix is end-of-text. Finer codes are sampled and "
+            "decoded as one window. The previous reply is not used. "
+            "This is continuation, not a chatbot."
         ),
+        session.level0_detail,
         (
             f"temperature={session.temperature:g} top_k={session.top_k} "
             f"top_p={session.top_p:g}"
@@ -199,6 +331,7 @@ def format_note(result: dict) -> str:
     truncated = "yes" if result["truncated"] else "no"
     repeated = "yes" if result["repeated"] else "no"
     return (
+        f"level0_source={result['level0_source']} "
         f"level0={level0} prefix={prefix} "
         f"prompt_tokens={result['prompt_tokens']} "
         f"encoded_pad={result['encoded_pad']} "
@@ -325,8 +458,94 @@ class _Prepared:
         _load_module(generator, self.generator_state, "generator")
 
 
+def _eos_prefix(session: ChatSession):
+    prefix_len = int(session.prefix_len)
+    if prefix_len < 0:
+        raise ChatError("prefix_len must be >= 0")
+    # Training feeds this slot a constant end-of-text id, not a content token.
+    prefix_ids = [int(session.pretok.eos_token_id)] * prefix_len
+    if prefix_len:
+        prefix = torch.tensor([prefix_ids], dtype=torch.long, device=session.device)
+    else:
+        prefix = torch.empty(1, 0, dtype=torch.long, device=session.device)
+    return prefix_ids, prefix
+
+
+def real_prompt_tokens(pretok, text: str, context_length: int) -> dict:
+    """Token ids of the prompt itself, truncated to the context and not repeated.
+
+    The prefix head and the unigram baseline both report this list. Neither
+    fills the rest of the window by tiling the prompt.
+    """
+    if not isinstance(text, str):
+        raise ChatError("prompt must be a string")
+    context_length = int(context_length)
+    if context_length < 1:
+        raise ChatError("context_length must be positive")
+    ids = list(pretok.encode(text))
+    truncated = len(ids) > context_length
+    kept = ids[:context_length]
+    pad = int(pretok.pad_token_id)
+    return {
+        "window_ids": list(kept),
+        "prompt_ids": list(kept),
+        "truncated": bool(truncated),
+        "repeated": False,
+        "prompt_tokens": len(kept),
+        "encoded_pad": sum(token == pad for token in kept),
+        "context_length": context_length,
+    }
+
+
+def _check_level0_request(cfg, prefix_head_path, level0_source, packed_path, unigram_max_windows):
+    source = str(level0_source or "prefix_head").strip().lower().replace("-", "_")
+    if source not in LEVEL0_SOURCES:
+        raise ChatError(
+            f"unknown --level0-source {level0_source!r}. Use prefix_head, packed, or unigram."
+        )
+    prefix_head_path = _path_or_none(prefix_head_path)
+    packed_path = _path_or_none(packed_path)
+    if source != "prefix_head" and prefix_head_path is not None:
+        raise ChatError(
+            "pass either --prefix-head or an explicit baseline "
+            f"--level0-source {source}, not both"
+        )
+    if source != "unigram" and packed_path is not None:
+        raise ChatError("--packed is only used with --level0-source unigram")
+    if source in {"prefix_head", "unigram"} and int(cfg["tokenizer"]["levels"][0]) != 1:
+        raise ChatError("this path expects a single level-0 code (levels[0] == 1)")
+    blob = None
+    if source == "prefix_head":
+        if prefix_head_path is None:
+            raise ChatError(MISSING_PREFIX_HEAD)
+        try:
+            blob = read_prefix_blob(prefix_head_path)
+            prefix_blob_matches(
+                blob,
+                int(cfg["tokenizer"]["embed_dim"]),
+                int(cfg["tokenizer"]["codebook_size"]),
+                int(cfg["tokenizer"]["context_length"]),
+            )
+        except PrefixLevel0Error as exc:
+            raise ChatError(str(exc)) from exc
+    elif source == "unigram":
+        if packed_path is None:
+            raise ChatError(
+                "--level0-source unigram needs --packed. "
+                "The file is only used to count level-0 codes. The prompt is not encoded."
+            )
+        if not packed_path.is_file():
+            raise ChatError(f"packed windows not found: {packed_path}")
+        if int(unigram_max_windows) < 1:
+            raise ChatError("--unigram-max-windows must be >= 1")
+    return source, prefix_head_path, packed_path, blob
+
+
 def pack_prompt_window(pretok, text: str, context_length: int) -> dict:
-    """Fill one context with the prompt, without a pad tail.
+    """Fill one context by repeating the prompt. Packed baseline only.
+
+    The prefix-head path does not call this. ``--level0-source packed`` does.
+    The window is filled without a pad tail.
 
     Training windows are slices of real tokens. A short paragraph is
     concatenated with what follows it; only a corpus tail is padded.

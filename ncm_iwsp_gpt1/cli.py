@@ -9,7 +9,15 @@ from pathlib import Path
 
 from ncm_iwsp_gpt1.audit import AuditError
 from ncm_iwsp_gpt1.build import build_models, parameter_report
-from ncm_iwsp_gpt1.chat import CHAT_DESCRIPTION, ChatError, open_session, run_interactive, run_prompt
+from ncm_iwsp_gpt1.chat import (
+    CHAT_DESCRIPTION,
+    LEVEL0_SOURCES,
+    ChatError,
+    open_session,
+    run_interactive,
+    run_prompt,
+)
+from ncm_iwsp_gpt1.prefix_level0 import PrefixLevel0Error, describe_prefix_run, run_prefix_level0
 from ncm_iwsp_gpt1.config import load_config
 from ncm_iwsp_gpt1.convert import FORMAT_NAME, ConvertError, convert_files, load_converted_checkpoint
 from ncm_iwsp_gpt1.evaluate import evaluate_windows
@@ -237,6 +245,10 @@ def _cmd_chat(args) -> int:
             tokenizer_path=args.tokenizer,
             generator_path=args.generator,
             finetune_path=args.finetune,
+            prefix_head_path=args.prefix_head,
+            level0_source=args.level0_source,
+            packed_path=args.packed,
+            unigram_max_windows=args.unigram_max_windows,
         )
     except (ChatError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -254,7 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "NCM-iWSP-GPT1. The writer loop scores closed-form weights. "
             "finetune is a separate gradient run of the untied generator. "
-            "chat decodes one window from a level-0 code and a one-token prefix."
+            "chat continues one window from a prefix level-0 head. "
+            "The generator prefix stays one end-of-text token."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -333,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     chat = sub.add_parser(
         "chat",
-        help="decode one window from a level-0 code and a one-token prefix",
+        help="continue one window from a prefix level-0 head",
         description=CHAT_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -364,7 +377,66 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="latest.pt with format ncm-iwsp-gpt1-finetune; optimizer state is ignored",
     )
+    chat.add_argument(
+        "--prefix-head",
+        default=None,
+        help="prefix level-0 checkpoint (format ncm-iwsp-gpt1-prefix-level0). Required unless a baseline is named.",
+    )
+    chat.add_argument(
+        "--level0-source",
+        default="prefix_head",
+        choices=LEVEL0_SOURCES,
+        help="prefix_head (default), or the packed / unigram comparison baselines",
+    )
+    chat.add_argument(
+        "--packed",
+        default=None,
+        help="packed windows used only by --level0-source unigram, to count level 0",
+    )
+    chat.add_argument(
+        "--unigram-max-windows",
+        type=int,
+        default=256,
+        help="how many packed rows to count for the unigram baseline",
+    )
     chat.set_defaults(func=_cmd_chat)
+
+    train_prefix = sub.add_parser(
+        "train-prefix-level0",
+        help="train only the prefix level-0 head; tokenizer and generator stay frozen",
+        description=(
+            "Train p(level-0 | first T tokens) on packed windows. "
+            "T is drawn from 1 through the context length. "
+            "The tokenizer and the generator are frozen. predict_level0 stays false "
+            "and prefix_len stays 1. This command does not submit a Kaggle job. "
+            "packed_windows.pt is not in the git repository; pass a local file. "
+            "A long run is not started unless --max-steps is set."
+        ),
+    )
+    train_prefix.add_argument("--config", default="configs/target.yaml")
+    train_prefix.add_argument("--tokenizer", default=None, help="frozen tokenizer.pt (required to train)")
+    train_prefix.add_argument(
+        "--generator",
+        default=None,
+        help="optional converted generator.pt or finetune latest.pt; loaded and frozen, not trained",
+    )
+    train_prefix.add_argument("--packed", default=None, help="packed_windows.pt or an iWSP visible cache")
+    train_prefix.add_argument("--out", default=None, help="directory for the prefix-head checkpoint and log")
+    train_prefix.add_argument("--resume", default=None, help="prefix-level0 checkpoint to continue; step must be < --max-steps")
+    train_prefix.add_argument("--dry-plan", action="store_true", help="print the run plan and exit without building")
+    train_prefix.add_argument("--max-steps", type=int, default=None, help="step to reach; required unless --dry-plan")
+    train_prefix.add_argument("--batch-size", type=int, default=8)
+    train_prefix.add_argument("--lr", type=float, default=1e-3)
+    train_prefix.add_argument("--weight-decay", type=float, default=0.01)
+    train_prefix.add_argument("--grad-clip", type=float, default=1.0)
+    train_prefix.add_argument("--log-every", type=int, default=10)
+    train_prefix.add_argument("--val-every", type=int, default=50)
+    train_prefix.add_argument("--save-every", type=int, default=100)
+    train_prefix.add_argument("--val-windows", type=int, default=32)
+    train_prefix.add_argument("--unigram-windows", type=int, default=256)
+    train_prefix.add_argument("--device", default="auto", help="auto, cuda, or cpu")
+    train_prefix.add_argument("--seed", type=int, default=None)
+    train_prefix.set_defaults(func=_cmd_train_prefix_level0)
 
     finetune = sub.add_parser(
         "finetune",
@@ -473,6 +545,51 @@ def _cmd_finetune(args) -> int:
             seed=args.seed,
         )
     except FinetuneError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_train_prefix_level0(args) -> int:
+    cfg = load_config(args.config)
+    if args.dry_plan:
+        options = {
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "max_steps": args.max_steps,
+        }
+        print(json.dumps(describe_prefix_run(cfg, options), indent=2))
+        return 0
+    if args.max_steps is None:
+        raise SystemExit(
+            "train-prefix-level0 needs --max-steps. "
+            "This command does not start a long run on its own and does not submit a Kaggle job. "
+            "packed_windows.pt is not in the repository; pass a local --packed file."
+        )
+    if not args.tokenizer or not args.packed or not args.out:
+        raise SystemExit("train-prefix-level0 needs --tokenizer, --packed, and --out")
+    try:
+        summary = run_prefix_level0(
+            cfg,
+            args.tokenizer,
+            args.packed,
+            args.out,
+            generator_path=args.generator,
+            max_steps=args.max_steps,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            seed=args.seed,
+            device=args.device,
+            log_every=args.log_every,
+            val_every=args.val_every,
+            save_every=args.save_every,
+            unigram_windows=args.unigram_windows,
+            val_windows=args.val_windows,
+            grad_clip=args.grad_clip,
+            resume=args.resume,
+        )
+    except PrefixLevel0Error as exc:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(summary, indent=2))
     return 0

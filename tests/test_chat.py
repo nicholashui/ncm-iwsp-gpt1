@@ -50,6 +50,10 @@ def test_parser_defaults_and_help_state_the_limit():
     assert args.tokenizer is None
     assert args.generator is None
     assert args.finetune is None
+    assert args.prefix_head is None
+    assert args.level0_source == "prefix_head"
+    assert args.packed is None
+    assert args.unigram_max_windows == 256
     action = next(
         item
         for item in parser._subparsers._actions
@@ -63,6 +67,9 @@ def test_parser_defaults_and_help_state_the_limit():
     assert "chatgpt" in help_text
     assert FORMAT_NAME in help_text
     assert "ncm-iwsp-gpt1-finetune" in help_text
+    assert "prefix-head" in help_text
+    assert "level0-source" in help_text
+    assert "continuation" in help_text
 
 
 @pytest.mark.parametrize("word", ["quit", "QUIT", "exit", "/quit", "/exit", "  exit  "])
@@ -97,7 +104,7 @@ def test_load_converted_checkpoint_layout(tmp_path):
         path,
     )
     stamp = path.stat().st_mtime_ns
-    session = open_session(_cfg(), device="cpu", checkpoint=path)
+    session = open_session(_cfg(), device="cpu", checkpoint=path, level0_source="packed")
     assert session.weights_label == "converted"
     assert torch.equal(session.vqvae.encoder.wte.weight.cpu(), tok["encoder.wte.weight"])
     assert torch.equal(session.generator.transformer.wte.weight.cpu(), gen["transformer.wte.weight"])
@@ -113,7 +120,9 @@ def test_load_split_init_blobs(tmp_path):
     prefixed = {f"module.{key}": value for key, value in gen.items()}
     torch.save({"model": tok, "step": 100000, "converted_from": {"kind": "unit"}}, tokenizer)
     torch.save({"model": prefixed, "step": 7, "converted_from": {"kind": "unit-generator"}}, generator)
-    session = open_session(_cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=generator)
+    session = open_session(
+        _cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=generator, level0_source="packed"
+    )
     assert session.weights_label == "split"
     assert "tokenizer_step=100000" in session.weights_detail
     assert "generator_step=7" in session.weights_detail
@@ -136,13 +145,17 @@ def test_load_finetune_ignores_optimizer(tmp_path):
         },
         latest,
     )
-    session = open_session(_cfg(), device="cpu", tokenizer_path=tokenizer, finetune_path=latest)
+    session = open_session(
+        _cfg(), device="cpu", tokenizer_path=tokenizer, finetune_path=latest, level0_source="packed"
+    )
     assert session.weights_label == "finetune"
     assert "generator_step=4" in session.weights_detail
     assert torch.equal(session.generator.transformer.wte.weight.cpu(), gen["transformer.wte.weight"])
     assert torch.equal(session.vqvae.encoder.wte.weight.cpu(), tok["encoder.wte.weight"])
     # The same latest.pt is a generator blob; --generator must not require a rewrap.
-    via_generator = open_session(_cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=latest)
+    via_generator = open_session(
+        _cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=latest, level0_source="packed"
+    )
     assert via_generator.weights_label == "finetune"
     assert torch.equal(via_generator.generator.transformer.wte.weight.cpu(), gen["transformer.wte.weight"])
 
@@ -156,13 +169,17 @@ def test_tied_head_and_shape_mismatch_are_refused(tmp_path):
     bad = tmp_path / "tied.pt"
     torch.save({"model": tied, "step": 1}, bad)
     with pytest.raises(ChatError, match="tied-head"):
-        open_session(_cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=bad)
+        open_session(
+            _cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=bad, level0_source="packed"
+        )
     mismatched = dict(gen)
     mismatched["lm_heads.0.weight"] = torch.zeros(2, 2)
     shape = tmp_path / "shape.pt"
     torch.save({"model": mismatched, "step": 1}, shape)
     with pytest.raises(ChatError, match="does not match"):
-        open_session(_cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=shape)
+        open_session(
+            _cfg(), device="cpu", tokenizer_path=tokenizer, generator_path=shape, level0_source="packed"
+        )
 
 
 def test_finetune_file_is_not_a_converted_checkpoint(tmp_path):
@@ -170,7 +187,7 @@ def test_finetune_file_is_not_a_converted_checkpoint(tmp_path):
     path = tmp_path / "latest.pt"
     torch.save({"format": "ncm-iwsp-gpt1-finetune", "model": gen, "optimizer": {}, "step": 1}, path)
     with pytest.raises(ChatError, match=FORMAT_NAME):
-        open_session(_cfg(), device="cpu", checkpoint=path)
+        open_session(_cfg(), device="cpu", checkpoint=path, level0_source="packed")
 
 
 def test_short_prompt_window_is_not_pad_or_first_token():
@@ -195,7 +212,9 @@ def test_short_prompt_window_is_not_pad_or_first_token():
 
 
 def test_reply_encodes_level0_and_decodes():
-    session = open_session(_cfg(), device="cpu", temperature=0.0, top_k=0, top_p=1.0, seed=0)
+    session = open_session(
+        _cfg(), device="cpu", temperature=0.0, top_k=0, top_p=1.0, seed=0, level0_source="packed"
+    )
     text = "How are you?"
     out = session.reply(text)
     ids = session.pretok.encode(text)
@@ -218,6 +237,7 @@ def test_reply_encodes_level0_and_decodes():
             session.vqvae.decode_logits(codes).argmax(dim=-1)[0],
             skip_special_tokens=True,
         )
+    assert out["level0_source"] == "packed"
     assert out["level0"] == indices[0, :1].tolist()
     assert out["level0"] != pad_level0
     assert out["level0"] != session.reply("a")["level0"]
@@ -232,7 +252,7 @@ def test_reply_encodes_level0_and_decodes():
 
 
 def test_long_prompt_is_truncated_to_context():
-    session = open_session(_cfg(), device="cpu", temperature=0.0)
+    session = open_session(_cfg(), device="cpu", temperature=0.0, level0_source="packed")
     text = "hello " * 80
     ids = session.pretok.encode(text)
     assert len(ids) > session.context_length
@@ -249,13 +269,30 @@ def test_long_prompt_is_truncated_to_context():
 
 
 def test_prompt_cli_prints_decoded_text(capsys):
-    session = open_session(_cfg(), device="cpu", temperature=0.0, seed=0)
+    session = open_session(_cfg(), device="cpu", temperature=0.0, seed=0, level0_source="packed")
     expected = session.reply("Hello")["text"]
-    assert main(["chat", "--config", "configs/gpt1_data.yaml", "--device", "cpu", "--prompt", "Hello"]) == 0
+    assert (
+        main(
+            [
+                "chat",
+                "--config",
+                "configs/gpt1_data.yaml",
+                "--device",
+                "cpu",
+                "--level0-source",
+                "packed",
+                "--prompt",
+                "Hello",
+            ]
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     assert captured.out == expected + "\n"
     assert "no checkpoint loaded" in captured.err
     assert "Not a causal LM" in captured.err
+    assert "level0_source=packed" in captured.err
+    assert "repeated=yes" in captured.err
 
 
 def test_checkpoint_prompt_cli(tmp_path, capsys):
@@ -265,7 +302,7 @@ def test_checkpoint_prompt_cli(tmp_path, capsys):
         {"format": FORMAT_NAME, "tokenizer": tok, "generator": gen, "report": {}},
         path,
     )
-    session = open_session(_cfg(), device="cpu", temperature=0.0, checkpoint=path)
+    session = open_session(_cfg(), device="cpu", temperature=0.0, checkpoint=path, level0_source="packed")
     expected = session.reply("Hello")["text"]
     assert (
         main(
@@ -277,6 +314,8 @@ def test_checkpoint_prompt_cli(tmp_path, capsys):
                 "cpu",
                 "--checkpoint",
                 str(path),
+                "--level0-source",
+                "packed",
                 "--prompt",
                 "Hello",
             ]
@@ -292,10 +331,13 @@ def test_checkpoint_prompt_cli(tmp_path, capsys):
 def test_interactive_one_turn_then_quit(monkeypatch, capsys):
     import io
 
-    session = open_session(_cfg(), device="cpu", temperature=0.0, seed=0)
+    session = open_session(_cfg(), device="cpu", temperature=0.0, seed=0, level0_source="packed")
     expected = session.reply("Hello")["text"]
     monkeypatch.setattr("sys.stdin", io.StringIO("Hello\nquit\n"))
-    assert main(["chat", "--config", "configs/gpt1_data.yaml", "--device", "cpu"]) == 0
+    assert (
+        main(["chat", "--config", "configs/gpt1_data.yaml", "--device", "cpu", "--level0-source", "packed"])
+        == 0
+    )
     captured = capsys.readouterr()
     assert captured.out == "you> " + expected + "\nyou> "
     assert "no checkpoint loaded" in captured.err
