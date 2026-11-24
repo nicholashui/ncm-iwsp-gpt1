@@ -14,6 +14,12 @@ import torch.nn.functional as F
 
 from ncm_iwsp_gpt1.build import lock_for_eval
 from ncm_iwsp_gpt1.device import resolve_device
+from ncm_iwsp_gpt1.prefix_protocol import (
+    PHASE2_FIXED_PROMPTS,
+    batch_prefix_tokens,
+    prefix_source_of,
+    window_prefix_ids,
+)
 
 # Fixed prompts for the qualitative hook. Prefix length in the shipped configs is 1,
 # so a prompt contributes at most one token; level 0 still comes from the unigram.
@@ -187,7 +193,9 @@ def evaluate_windows(
             code_chunks.append(indices.cpu())
 
             ncm_in = vqvae.vq.idx_to_ncm_input(indices)
-            prefix = _prefix(batch.shape[0], prefix_len, eos_id, device)
+            prefix = batch_prefix_tokens(
+                batch, prefix_len, prefix_source_of(generator), eos_id, pad_id
+            )
             prefix_latent = vqvae.encoder.wte(prefix)
             teacher = torch.cat([prefix_latent, ncm_in], dim=1)
             pred_logits = generator(teacher)
@@ -350,29 +358,69 @@ def _qualitative(pretok, vqvae, generator, train_idx, visible, n_generate, tempe
             prefix = torch.full((n, prefix_len), int(eos_id), dtype=torch.long, device=model_device)
             model_codes = generator.generate(l0.to(model_device), prefix, temperature=temperature, top_k=0, top_p=1.0)
             model_text = vqvae.decode_logits(model_codes).argmax(dim=-1)
+            phase2 = prefix_source_of(generator) == "window"
             for row in model_text:
-                samples.append(
-                    {
-                        "kind": "unigram_l0_then_generator",
-                        "text": pretok.decode(row.tolist(), skip_special_tokens=True)[:180],
-                    }
-                )
+                sample = {
+                    "kind": "unigram_l0_then_generator",
+                    "text": pretok.decode(row.tolist(), skip_special_tokens=True)[:180],
+                }
+                if phase2:
+                    sample["prefix_source"] = "eos"
+                    sample["note"] = "control: unigram level-0 and an end-of-text prefix"
+                samples.append(sample)
             for prompt in FIXED_PROMPTS:
                 ids = pretok.encode(prompt) or [int(eos_id)]
-                prefix_ids = (ids + [int(pad_id)] * prefix_len)[:prefix_len]
+                prefix_ids = window_prefix_ids(ids, prefix_len, pad_id)
                 prefix = torch.tensor([prefix_ids], dtype=torch.long, device=model_device)
                 draw = torch.multinomial(probs, levels[0], replacement=True, generator=generator_seed)
                 codes = generator.generate(
                     draw.view(1, levels[0]).to(model_device), prefix, temperature=temperature, top_k=0, top_p=1.0
                 )
                 text = vqvae.decode_logits(codes).argmax(dim=-1)[0]
-                samples.append(
-                    {
-                        "kind": "fixed_prompt",
-                        "prompt": prompt,
-                        "text": pretok.decode(text.tolist(), skip_special_tokens=True)[:180],
-                    }
-                )
+                sample = {
+                    "kind": "fixed_prompt",
+                    "prompt": prompt,
+                    "text": pretok.decode(text.tolist(), skip_special_tokens=True)[:180],
+                }
+                if phase2:
+                    sample["prefix_source"] = "window"
+                    sample["level0_source"] = "unigram"
+                    sample["prefix_ids"] = list(prefix_ids)
+                    sample["note"] = (
+                        "Prompt tokens are in the prefix. Level 0 is still the unigram, "
+                        "not the prefix head. Score the decoded window."
+                    )
+                samples.append(sample)
+            if phase2:
+                for prompt in PHASE2_FIXED_PROMPTS:
+                    ids = pretok.encode(prompt) or [int(eos_id)]
+                    prefix_ids = window_prefix_ids(ids, prefix_len, pad_id)
+                    prefix = torch.tensor([prefix_ids], dtype=torch.long, device=model_device)
+                    draw = torch.multinomial(probs, levels[0], replacement=True, generator=generator_seed)
+                    codes = generator.generate(
+                        draw.view(1, levels[0]).to(model_device),
+                        prefix,
+                        temperature=temperature,
+                        top_k=0,
+                        top_p=1.0,
+                    )
+                    text = vqvae.decode_logits(codes).argmax(dim=-1)[0]
+                    samples.append(
+                        {
+                            "kind": "phase2_fixed_prompt",
+                            "prompt": prompt,
+                            "prefix_source": "window",
+                            "level0_source": "unigram",
+                            "prefix_ids": list(prefix_ids),
+                            "text": pretok.decode(text.tolist(), skip_special_tokens=True)[:180],
+                            "decoded_window": pretok.decode(text.tolist(), skip_special_tokens=True),
+                            "note": (
+                                "Same window-prefix protocol as chat. Level 0 here is the "
+                                "unigram control, not a prefix-head sample. The decoded "
+                                "window is the score, not a display splice."
+                            ),
+                        }
+                    )
     return samples
 
 

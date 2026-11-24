@@ -102,7 +102,7 @@ python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
 
 ## 文字對話
 
-`python -m ncm_iwsp_gpt1 chat` 把短提示接成一個 window 的延續。它不是 causal LM，也不是聊天機器人，也不是 NCM-GPT1。`predict_level0` 維持 false，level 0 不是 generator 的目標。`prefix_len` 維持 1，那個位置仍是 `<|endoftext|>`，用來對上現有權重。提示詞不放進這個前綴。
+`python -m ncm_iwsp_gpt1 chat` 把短提示接成一個 window 的延續。它不是 causal LM，也不是聊天機器人，也不是 NCM-GPT1。`predict_level0` 維持 false，level 0 不是 generator 的目標。預設 config 是 phase 1：`prefix_len` 維持 1，那個位置仍是 `<|endoftext|>`，用來對上現有權重。提示詞不放進這個前綴。Phase 2 是另一份 config，`configs/target_phase2.yaml`（`prefix_len` 32，`prefix_source: window`），提示詞放進前綴。這份程式不啟動訓練。
 
 預設要一個前綴 level-0 頭（`--prefix-head`）。頭讀真實提示的 `encoder.wte`，抽出一個 level-0，不再把短句重複填滿 context。細碼仍由凍結的 generator 抽出再解碼。stderr 印 `level0_source=prefix_head`。沒有這個 checkpoint 就停下來，不會退回重複打包。對照組要寫明：`--level0-source packed`，或 `--level0-source unigram --packed packed_windows.pt`。
 
@@ -124,7 +124,7 @@ cd /d e:\Project\ncm-iwsp-gpt1
   --prompt "The cat sat"
 ```
 
-`--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The generator prefix stays `<|endoftext|>`. See [`docs/chat.md`](docs/chat.md). The v3 generator is not in git. The prefix head, its metrics, and the val-CE plot are in [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/).
+`--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The default config keeps the generator prefix as `<|endoftext|>`. Phase 2 is `--config configs/target_phase2.yaml`: `prefix_len` 32, and the prompt is placed in that prefix (right-pad with pad id 50257). The small CPU file is `configs/gpt1_data_phase2.yaml` (`prefix_len` 8). See [`docs/chat.md`](docs/chat.md). This change does not start training. The v3 generator is not in git. The prefix head, its metrics, and the val-CE plot are in [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/).
 
 ## 安裝
 
