@@ -267,7 +267,8 @@ def build_parser() -> argparse.ArgumentParser:
             "NCM-iWSP-GPT1. The writer loop scores closed-form weights. "
             "finetune is a separate gradient run of the untied generator. "
             "chat continues one window from a prefix level-0 head. "
-            "The generator prefix stays one end-of-text token."
+            "The default config keeps a one-token end-of-text prefix. "
+            "configs/target_phase2.yaml places the prompt in a longer prefix."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -558,7 +559,11 @@ def _cmd_train_prefix_level0(args) -> int:
             "lr": args.lr,
             "max_steps": args.max_steps,
         }
-        print(json.dumps(describe_prefix_run(cfg, options), indent=2))
+        try:
+            plan = describe_prefix_run(cfg, options)
+        except PrefixLevel0Error as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(plan, indent=2))
         return 0
     if args.max_steps is None:
         raise SystemExit(

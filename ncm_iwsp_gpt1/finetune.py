@@ -26,6 +26,14 @@ from torch.utils.data import DataLoader, Dataset
 
 from ncm_iwsp_gpt1.build import build_models
 from ncm_iwsp_gpt1.device import resolve_device
+from ncm_iwsp_gpt1.prefix_protocol import (
+    batch_prefix_tokens,
+    legacy_prefix_warning,
+    load_generator_state,
+    normalize_prefix_source,
+    prefix_metadata_problems,
+    recorded_prefix,
+)
 
 FINETUNE_FORMAT = "ncm-iwsp-gpt1-finetune"
 PACKED_FILENAME = "packed_windows.pt"
@@ -107,7 +115,9 @@ def describe_run(cfg: dict, options: dict | None = None) -> dict:
     alpha = float(options.get("alpha", DEFAULT_ALPHA))
     mid_aux = float(options.get("mid_aux", DEFAULT_MID_AUX))
     levels = [int(level) for level in tokenizer["levels"]]
-    return {
+    prefix_len = int(generator.get("prefix_len", 1))
+    prefix_source = normalize_prefix_source(generator.get("prefix_source", "eos"))
+    plan = {
         "system": "NCM-iWSP-GPT1",
         "config_name": cfg["name"],
         "context_length": int(tokenizer["context_length"]),
@@ -119,6 +129,11 @@ def describe_run(cfg: dict, options: dict | None = None) -> dict:
         "n_embd": int(generator["n_embd"]),
         "n_head": int(generator["n_head"]),
         "predict_level0": False,
+        "prefix_len": prefix_len,
+        "prefix_source": prefix_source,
+        "prefix_pad": "right" if prefix_source == "window" else None,
+        "generator_sequence_length": prefix_len + int(sum(levels[1:])),
+        "retrain_prefix_head": False,
         "untied_heads": True,
         "post_upsample_conv": False,
         "tokenizer_frozen": True,
@@ -147,6 +162,15 @@ def describe_run(cfg: dict, options: dict | None = None) -> dict:
         ],
         "writes": "only the --out directory",
     }
+    if prefix_source == "window":
+        plan["hyperparameter_note"] = (
+            "peak_lr, floor_lr, warmup, max_steps, batch_size, grad_accum, "
+            "corruption, and validation frequency are the existing finetune CLI "
+            "defaults. They are not a chosen Phase 2 recipe, and this plan does "
+            "not start training. The prefix head is not retrained. A later run "
+            "must pass --confirm and must write to a new --out directory."
+        )
+    return plan
 
 
 def level_weights(levels, alpha: float, device=None, dtype=torch.float32) -> torch.Tensor:
@@ -382,7 +406,10 @@ def load_module_init(path, module, label: str) -> dict:
     if label == "generator":
         assert_untied_generator_state(state)
     try:
-        module.load_state_dict(state, strict=True)
+        if label == "generator":
+            load_generator_state(module, state)
+        else:
+            module.load_state_dict(state, strict=True)
     except (RuntimeError, KeyError) as exc:
         raise FinetuneError(f"{label} init does not match this config: {exc}") from exc
     return meta
@@ -584,7 +611,16 @@ def _unwrap(model):
     return getattr(model, "module", model)
 
 
-def _prepare_batch(vqvae, generator, tokens, eos_id: int, corrupt: bool, p_max: float, p_min: float):
+def _prepare_batch(
+    vqvae,
+    generator,
+    tokens,
+    eos_id: int,
+    corrupt: bool,
+    p_max: float,
+    p_min: float,
+    pad_id: int,
+):
     with torch.no_grad():
         indices = vqvae.encode(tokens)
         levels = [int(level) for level in vqvae.vq.levels]
@@ -593,11 +629,12 @@ def _prepare_batch(vqvae, generator, tokens, eos_id: int, corrupt: bool, p_max: 
         if corrupt and (float(p_max) > 0.0 or float(p_min) > 0.0):
             source = corrupt_codes(indices, levels, vocabs, p_max, p_min)
         latent = vqvae.vq.idx_to_ncm_input(source)
-        prefix = torch.full(
-            (tokens.shape[0], int(generator.prefix_len)),
+        prefix = batch_prefix_tokens(
+            tokens,
+            int(generator.prefix_len),
+            generator.prefix_source,
             int(eos_id),
-            dtype=torch.long,
-            device=tokens.device,
+            int(pad_id),
         )
         teacher = torch.cat([vqvae.encoder.wte(prefix), latent], dim=1)
         targets = indices[:, levels[0] :]
@@ -760,7 +797,7 @@ def _cuda_mem_gb() -> float:
     return float(torch.cuda.max_memory_allocated()) / (1024**3)
 
 
-def _evaluate(vqvae, generator, loader, device, eos_id, alpha, mid_aux, autocast):
+def _evaluate(vqvae, generator, loader, device, eos_id, pad_id, alpha, mid_aux, autocast):
     training = generator.training
     generator.eval()
     sums = None
@@ -771,7 +808,14 @@ def _evaluate(vqvae, generator, loader, device, eos_id, alpha, mid_aux, autocast
     for batch in loader:
         tokens = batch.to(device, non_blocking=device.type == "cuda")
         teacher, targets, levels, vocabs = _prepare_batch(
-            vqvae, generator, tokens, eos_id, corrupt=False, p_max=0.0, p_min=0.0
+            vqvae,
+            generator,
+            tokens,
+            eos_id,
+            corrupt=False,
+            p_max=0.0,
+            p_min=0.0,
+            pad_id=pad_id,
         )
         with torch.no_grad():
             with autocast:
@@ -892,6 +936,34 @@ def run_finetune(
         _cleanup_process(started_dist)
 
 
+def _refuse_resume_prefix(blob: dict, generator) -> None:
+    """Resume only when the checkpoint was trained with this prefix protocol.
+
+    A v3 file that omits ``prefix_len`` can resume the phase-1 config. It cannot
+    resume a phase-2 config: that file is a warm start (``--resume none``), not
+    an optimizer continuation.
+    """
+    recorded = recorded_prefix(blob)
+    if recorded is None:
+        if generator.prefix_source == "eos" and int(generator.prefix_len) == 1:
+            return
+        raise FinetuneError(
+            "resume checkpoint does not record prefix_len. "
+            "A phase-1 file can resume only prefix_len 1 and prefix_source eos. "
+            "Warm-start a phase-2 run with --generator pointing at that file and "
+            "--resume none. Do not resume its optimizer into a different prefix."
+        )
+    problems = prefix_metadata_problems(
+        recorded, int(generator.prefix_len), generator.prefix_source
+    )
+    if problems:
+        raise FinetuneError(
+            "resume checkpoint prefix does not match this config: "
+            + "; ".join(problems)
+            + ". Start a new --out with --resume none to warm-start the weights."
+        )
+
+
 def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, device, rank, world_size, local_rank, **opt):
     main = _is_main(rank)
     seed = int(cfg["seed"] if opt["seed"] is None else opt["seed"])
@@ -938,6 +1010,19 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
     torch.manual_seed(seed + rank)
     tok_meta = load_module_init(tokenizer_path, vqvae, "tokenizer")
     gen_meta = load_module_init(generator_path, generator, "generator")
+    warmstart = legacy_prefix_warning(gen_meta, generator.prefix_source)
+    mismatch = prefix_metadata_problems(
+        recorded_prefix(gen_meta), generator.prefix_len, generator.prefix_source
+    )
+    if mismatch:
+        warmstart = (
+            "generator init prefix metadata differs from this config ("
+            + "; ".join(mismatch)
+            + "). Persistent transformer and lm_heads weights are still loaded. "
+            "This is a warm start. Resume refuses a different prefix protocol."
+        )
+    if main and warmstart:
+        print(warmstart, flush=True)
     vqvae.eval()
     for param in vqvae.parameters():
         param.requires_grad_(False)
@@ -968,8 +1053,10 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                 f"{resume_path} format is {resume_blob.get('format')!r}. "
                 f"Resume expects {FINETUNE_FORMAT}."
             )
-        assert_untied_generator_state(resume_blob["model"])
-        generator.load_state_dict(resume_blob["model"], strict=True)
+        resume_state = _strip_module_prefix(resume_blob["model"])
+        assert_untied_generator_state(resume_state)
+        _refuse_resume_prefix(resume_blob, generator)
+        load_generator_state(generator, resume_state)
         if isinstance(resume_blob.get("optimizer"), dict):
             optimizer.load_state_dict(resume_blob["optimizer"])
             _optimizer_to_device(optimizer, device)
@@ -1043,10 +1130,15 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                 "loss_comparable_to_alpha0": comparable,
                 "loss_note": note,
             },
+            "prefix_len": int(module.prefix_len),
+            "prefix_source": str(module.prefix_source),
             "architecture": {
                 "untied_heads": True,
                 "post_upsample_conv": False,
                 "predict_level0": False,
+                "prefix_len": int(module.prefix_len),
+                "prefix_source": str(module.prefix_source),
+                "prefix_pad": "right" if module.prefix_source == "window" else None,
                 "chunked_block_attn": bool(opt["chunked_block_attn"]),
                 "gradient_checkpointing": bool(opt["gradient_checkpointing"]),
             },
@@ -1080,6 +1172,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                     val_loader,
                     device,
                     int(pretok.eos_token_id),
+                    int(pretok.pad_token_id),
                     opt["alpha"],
                     opt["mid_aux"],
                     autocast,
@@ -1146,6 +1239,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                     corrupt=True,
                     p_max=opt["corrupt_p_max"],
                     p_min=opt["corrupt_p_min"],
+                    pad_id=int(pretok.pad_token_id),
                 )
                 sync = micro == accum - 1
                 with _sync_context(net, sync):

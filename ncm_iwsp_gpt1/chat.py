@@ -1,14 +1,19 @@
 """One-window continuation for NCM-iWSP-GPT1.
 
 This is not a causal language model and not a chatbot. ``predict_level0`` is
-false, so level 0 is not a generator target. Shipped configs keep
-``prefix_len`` at 1, and that slot stays ``<|endoftext|>`` so existing
-weights see the prefix they were trained with.
+false, so level 0 is not a generator target.
+
+``configs/target.yaml`` and ``configs/gpt1_data.yaml`` are phase 1:
+``prefix_len`` 1, and that slot stays ``<|endoftext|>`` so existing weights
+see the prefix they were trained with. ``configs/target_phase2.yaml`` is the
+longer prefix. Its slots hold the prompt (right-padded with the pad id,
+truncated to ``prefix_len``). The default chat config stays phase 1.
 
 The default path samples the single level-0 code from a prefix head on the
 real prompt tokens (``encoder.wte``, not a window filled by repeating the
 prompt). The generator then samples the finer codes. Packed-repeat encode
-and a train-set unigram are explicit baselines, not the fallback.
+and a train-set unigram are explicit baselines, not the fallback. Missing
+``--prefix-head`` still exits on both phases.
 """
 
 from __future__ import annotations
@@ -32,6 +37,14 @@ from ncm_iwsp_gpt1.prefix_level0 import (
     read_prefix_blob,
     sample_logits,
 )
+from ncm_iwsp_gpt1.prefix_protocol import (
+    display_continuation,
+    legacy_prefix_warning,
+    load_generator_state,
+    prefix_metadata_problems,
+    recorded_prefix,
+    window_prefix_ids,
+)
 
 FINETUNE_FORMAT = "ncm-iwsp-gpt1-finetune"
 QUIT_COMMANDS = frozenset({"quit", "exit", "/quit", "/exit"})
@@ -52,17 +65,27 @@ Continue one text window with NCM-iWSP-GPT1.
 
 This is not a causal language model and not ChatGPT. It continues a short
 prompt as one reconstructed window. It does not answer questions. predict_level0
-is false, so level 0 is not a generator target. The shipped configs set
-prefix_len to 1. That slot stays <|endoftext|>, the prefix the generator
-weights were trained with. The prompt is not placed in that slot.
+is false, so level 0 is not a generator target.
+
+Phase 1 is the default config, configs/target.yaml (and the small
+configs/gpt1_data.yaml). Those configs set prefix_len to 1. That slot stays
+<|endoftext|>, the prefix the existing generator weights were trained with.
+The prompt is not placed in that slot.
+
+Phase 2 is configs/target_phase2.yaml (small file: configs/gpt1_data_phase2.yaml).
+prefix_len is 32 on the 12/768 file. The prompt tokens fill that prefix.
+A short prompt is right-padded with the pad id. A longer prompt keeps its
+first prefix_len tokens. Select phase 2 with --config. This command does not
+start training.
 
 The default path needs a prefix level-0 head (--prefix-head, format
 {PREFIX_LEVEL0_FORMAT}). The head reads the real prompt through the frozen
 tokenizer encoder.wte and samples one level-0 code. The line is not padded
 to the context and not repeated until the context is full. NextConceptGenerator.generate
-then samples the finer codes from that code and the end-of-text prefix.
-The VQ-VAE decoder turns the code grid into one window. stderr prints
-level0_source=prefix_head.
+then samples the finer codes. The VQ-VAE decoder turns the code grid into one
+window. stderr prints level0_source=prefix_head. On phase 2 it also prints
+prefix_source=window. stdout may show the original prompt in front of the
+decoded window; the scored text is the window the model decoded.
 
 Without --prefix-head, chat stops. It does not silently encode a packed
 repeat of the prompt. Two comparison baselines are explicit:
@@ -72,7 +95,9 @@ repeat of the prompt. Two comparison baselines are explicit:
       VQVAE.encode and keep level 0
   --level0-source unigram --packed packed_windows.pt
       draw level 0 from an add-one unigram of those windows. The prompt does
-      not choose the code. The generator prefix is still end-of-text.
+      not choose the code. On phase 1 the generator prefix is still
+      end-of-text. On phase 2 the prefix is the prompt; the phase-1 config
+      remains the unigram-plus-end-of-text control.
 
 Turns are independent: the previous reply is not fed back. temperature 0 is
 argmax. top_k 0 and top_p 1 disable truncation. This is continuation, not a
@@ -127,17 +152,18 @@ class ChatSession:
         self.config_name = str(config_name)
         self.context_length = int(vqvae.context_length)
         self.prefix_len = int(generator.prefix_len)
+        self.prefix_source = str(generator.prefix_source)
         self.level0_len = int(vqvae.vq.levels[0])
         self.level0_source = str(level0_source)
         self.prefix_head = prefix_head
         self.unigram_probs = unigram_probs
         self.level0_detail = str(level0_detail)
+        self.prefix_warning = ""
 
     def reply(self, text: str) -> dict:
         """Sample level 0 for ``text``, then finer codes, and decode one window."""
         if not isinstance(text, str):
             raise ChatError("prompt must be a string")
-        prefix_ids, prefix = _eos_prefix(self)
         with torch.no_grad():
             if self.level0_source == "packed":
                 packed = pack_prompt_window(self.pretok, text, self.context_length)
@@ -156,10 +182,22 @@ class ChatSession:
                 level0 = self._level0_from_unigram()
             else:
                 raise ChatError(f"unknown level0_source {self.level0_source!r}")
+            prefix_ids, prefix = self._generator_prefix(packed["prompt_ids"])
             decoded_ids = self._decode_ids(level0, prefix)
+        decoded = self.pretok.decode(decoded_ids, skip_special_tokens=True)
+        if self.prefix_source == "window":
+            display, prepended = display_continuation(text, decoded)
+        else:
+            display, prepended = decoded, False
+        pad = int(self.pretok.pad_token_id)
         packed["prefix_ids"] = prefix_ids
         packed["prefix_len"] = len(prefix_ids)
-        packed["text"] = self.pretok.decode(decoded_ids, skip_special_tokens=True)
+        packed["prefix_source"] = self.prefix_source
+        packed["prefix_pad"] = sum(token == pad for token in prefix_ids)
+        packed["decoded_window"] = decoded
+        packed["text"] = decoded
+        packed["display_text"] = display
+        packed["prompt_prepended"] = bool(prepended)
         packed["level0"] = [int(value) for value in level0[0].tolist()]
         packed["level0_source"] = self.level0_source
         return packed
@@ -184,6 +222,17 @@ class ChatSession:
         logits = torch.log(self.unigram_probs.clamp_min(1e-12)).view(1, -1)
         draw = sample_logits(logits, self.temperature, self.top_k, self.top_p)
         return draw.reshape(1, self.level0_len)
+
+    def _generator_prefix(self, prompt_ids: list[int]):
+        """Phase 1 fills end-of-text. Phase 2 places the prompt in the prefix."""
+        if self.prefix_source != "window":
+            return _eos_prefix(self)
+        prefix_ids = window_prefix_ids(prompt_ids, self.prefix_len, int(self.pretok.pad_token_id))
+        if self.prefix_len:
+            prefix = torch.tensor([prefix_ids], dtype=torch.long, device=self.device)
+        else:
+            prefix = torch.empty(1, 0, dtype=torch.long, device=self.device)
+        return prefix_ids, prefix
 
     def _decode_ids(self, level0, prefix) -> torch.Tensor:
         codes = self.generator.generate(
@@ -230,8 +279,23 @@ def open_session(
     resolved = resolve_device(device)
     prepared = prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path)
     pretok, vqvae, generator = build_models(cfg)
+    prefix_warning = ""
     if prepared is not None:
         prepared.apply(vqvae, generator)
+        problems = prefix_metadata_problems(
+            recorded_prefix(prepared.generator_meta),
+            int(generator.prefix_len),
+            generator.prefix_source,
+        )
+        if problems:
+            raise ChatError(
+                "generator checkpoint prefix does not match this config: "
+                + "; ".join(problems)
+                + ". A checkpoint that records a different prefix_len stays on the "
+                "config it was trained with. A v3 file that omits prefix_len can "
+                "load on the phase-2 config only as a negative control."
+            )
+        prefix_warning = legacy_prefix_warning(prepared.generator_meta, generator.prefix_source) or ""
         weights_label = prepared.layout
         weights_detail = prepared.detail
         del prepared
@@ -281,7 +345,7 @@ def open_session(
             "block is repeated to the context, then encoded. This is not the prefix head."
         )
     torch.manual_seed(int(seed))
-    return ChatSession(
+    session = ChatSession(
         pretok,
         vqvae,
         generator,
@@ -297,24 +361,42 @@ def open_session(
         unigram_probs,
         level0_detail,
     )
+    session.prefix_warning = prefix_warning
+    return session
 
 
 def startup_message(session: ChatSession) -> str:
-    lines = [
-        (
+    if session.prefix_source == "window":
+        first = (
+            f"{session.config_name}: context {session.context_length}, "
+            f"prefix_len {session.prefix_len}, device {session.device}. "
+            f"Not a causal LM. level0_source={session.level0_source}. "
+            "prefix_source=window. Prompt tokens fill the generator prefix "
+            f"(right-pad with pad id {int(session.pretok.pad_token_id)}, "
+            "truncate to prefix_len). Level 0 still comes from the selected source. "
+            "Finer codes are sampled and decoded as one window. "
+            "The previous reply is not used. "
+            "This is continuation, not a chatbot."
+        )
+    else:
+        first = (
             f"{session.config_name}: context {session.context_length}, "
             f"prefix_len {session.prefix_len}, device {session.device}. "
             f"Not a causal LM. level0_source={session.level0_source}. "
             "The generator prefix is end-of-text. Finer codes are sampled and "
             "decoded as one window. The previous reply is not used. "
             "This is continuation, not a chatbot."
-        ),
+        )
+    lines = [
+        first,
         session.level0_detail,
         (
             f"temperature={session.temperature:g} top_k={session.top_k} "
             f"top_p={session.top_p:g}"
         ),
     ]
+    if session.prefix_warning:
+        lines.append(session.prefix_warning)
     if session.weights_label == "init":
         lines.append(
             "warning: no checkpoint loaded. Replies use the seeded initialization, "
@@ -330,19 +412,22 @@ def format_note(result: dict) -> str:
     prefix = ",".join(str(value) for value in result["prefix_ids"])
     truncated = "yes" if result["truncated"] else "no"
     repeated = "yes" if result["repeated"] else "no"
+    prepended = "yes" if result.get("prompt_prepended") else "no"
     return (
         f"level0_source={result['level0_source']} "
         f"level0={level0} prefix={prefix} "
+        f"prefix_source={result.get('prefix_source', 'eos')} "
         f"prompt_tokens={result['prompt_tokens']} "
         f"encoded_pad={result['encoded_pad']} "
-        f"repeated={repeated} truncated={truncated}"
+        f"repeated={repeated} truncated={truncated} "
+        f"prompt_prepended={prepended}"
     )
 
 
 def run_prompt(session: ChatSession, text: str) -> int:
     print(startup_message(session), file=sys.stderr, flush=True)
     result = session.reply(text)
-    print(result["text"], flush=True)
+    print(result["display_text"], flush=True)
     print(format_note(result), file=sys.stderr, flush=True)
     return 0
 
@@ -364,7 +449,7 @@ def run_interactive(session: ChatSession) -> int:
         if not line.strip():
             continue
         result = session.reply(line)
-        print(result["text"], flush=True)
+        print(result["display_text"], flush=True)
         print(format_note(result), file=sys.stderr, flush=True)
 
 
@@ -398,6 +483,9 @@ def prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path):
         # maps so a module. prefix is not required of the caller.
         blob["tokenizer"] = tok_state
         blob["generator"] = gen_state
+        for key in ("prefix_len", "prefix_source", "architecture"):
+            if key in blob and key not in gen_meta:
+                gen_meta[key] = blob[key]
         return _Prepared(
             layout="converted",
             detail=_detail("converted", None, None, checkpoint, tok_meta, gen_meta),
@@ -405,6 +493,7 @@ def prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path):
             generator_state=gen_state,
             converted_blob=blob,
             checkpoint=str(checkpoint),
+            generator_meta=gen_meta,
         )
 
     tok_blob = _read_blob(tokenizer_path)
@@ -430,17 +519,28 @@ def prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path):
         detail=_detail(layout, tokenizer_path, gen_file, None, tok_meta, gen_meta),
         tokenizer_state=tok_state,
         generator_state=gen_state,
+        generator_meta=gen_meta,
     )
 
 
 class _Prepared:
-    def __init__(self, layout, detail, tokenizer_state, generator_state, converted_blob=None, checkpoint=None):
+    def __init__(
+        self,
+        layout,
+        detail,
+        tokenizer_state,
+        generator_state,
+        converted_blob=None,
+        checkpoint=None,
+        generator_meta=None,
+    ):
         self.layout = layout
         self.detail = detail
         self.tokenizer_state = tokenizer_state
         self.generator_state = generator_state
         self.converted_blob = converted_blob
         self.checkpoint = checkpoint
+        self.generator_meta = dict(generator_meta or {})
 
     def apply(self, vqvae, generator) -> None:
         if self.layout == "converted":
@@ -717,7 +817,10 @@ def _require_untied(state: dict) -> None:
 
 def _load_module(module, state: dict, label: str) -> None:
     try:
-        module.load_state_dict(state, strict=True)
+        if label == "generator":
+            load_generator_state(module, state)
+        else:
+            module.load_state_dict(state, strict=True)
     except (RuntimeError, KeyError) as exc:
         raise ChatError(f"{label} checkpoint does not match this config: {exc}") from exc
 

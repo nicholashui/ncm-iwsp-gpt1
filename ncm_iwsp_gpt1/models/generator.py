@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from ncm_iwsp_gpt1.models.layers import GeneratorBlock, LayerNorm, init_output_projections, precompute_rope_cos_sin
+from ncm_iwsp_gpt1.prefix_protocol import normalize_prefix_source
 
 
 def _run_block(hidden, block, attn_mask, rope, segments):
@@ -31,6 +32,11 @@ class NextConceptGenerator(nn.Module):
         self._vqvae = (vqvae,)
         self.levels = list(vqvae.vq.levels)
         self.prefix_len = int(generator_cfg.get("prefix_len", 1))
+        if self.prefix_len < 0:
+            raise ValueError("prefix_len must be >= 0")
+        # eos: phase 1, a constant <|endoftext|> prefix. window: phase 2, the
+        # start of the real token row. The mask below does not depend on which.
+        self.prefix_source = normalize_prefix_source(generator_cfg.get("prefix_source", "eos"))
         self.n_embd = int(generator_cfg["n_embd"])
         self.n_head = int(generator_cfg["n_head"])
         self.n_layer = int(generator_cfg["n_layer"])

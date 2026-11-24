@@ -1,0 +1,61 @@
+# Small phase-2 config. Same runnable body as configs/gpt1_data.yaml.
+# prefix_len is 8, not 32: context is 32, so a short prompt can be padded and
+# a longer prompt can be truncated inside one window. Shape tests still build
+# prefix_len 32 and 64 on this architecture. The 12/768 choice is
+# configs/target_phase2.yaml (prefix_len 32).
+#
+# prefix_source window puts the start of the token row in the generator
+# prefix. Short rows are right-padded with pad id 50257. This file does not
+# train, and it does not replace configs/gpt1_data.yaml.
+name: NCM-iWSP-GPT1-runnable-phase2
+seed: 0
+heavy: false
+
+pretok:
+  kind: gpt2
+  pad_vocab_to: 50304
+
+tokenizer:
+  embed_dim: 32
+  context_length: 32
+  n_heads: 4
+  dropout: 0.0
+  enc_layers: 0
+  dec_layers: 1
+  use_qk_norm: true
+  pre_quant_groupnorm: 8
+  codebook_size: 64
+  levels: [1, 4, 9, 16, 25, 32]
+  learned_l1_sampling: true
+  learned_l1_cascade: true
+  learned_l1_cascade_base: 4
+  quant_resi:
+    enabled: true
+    ratio: 0.5
+
+generator:
+  n_layer: 2
+  n_head: 4
+  n_embd: 32
+  bias: true
+  dropout: 0.0
+  prefix_len: 8
+  prefix_source: window
+  rope_base: 100000
+  use_rope: true
+  use_level_encoding: true
+  use_qk_norm: true
+  attn_pattern: block_diagonal
+  predict_level0: false
+
+data:
+  dataset: lucadiliello/bookcorpusopen
+  hidden_pct: 10
+  visible_pct: 10
+  max_windows: 32
+
+eval:
+  batch_size: 2
+  max_windows: 4
+  n_generate: 1
+  device: auto

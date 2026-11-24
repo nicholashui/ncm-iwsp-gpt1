@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 from ncm_iwsp_gpt1.levels import square_levels
+from ncm_iwsp_gpt1.prefix_protocol import normalize_prefix_source
 
 
 _RESERVED_NAMES = {"ncm-gpt1", "gpt1", "ncmgpt1"}
@@ -66,6 +67,15 @@ def _validate(cfg: dict, path: Path) -> None:
     generator = cfg["generator"]
     if generator.get("predict_level0", False):
         raise ValueError("predict_level0 must stay false, as in NCM-GPT1")
+    try:
+        normalize_prefix_source(generator.get("prefix_source", "eos"))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    prefix_len = generator.get("prefix_len", 1)
+    if isinstance(prefix_len, bool) or not isinstance(prefix_len, (int, float)) or int(prefix_len) < 0:
+        raise ValueError("generator.prefix_len must be an integer >= 0")
+    if int(prefix_len) != prefix_len:
+        raise ValueError("generator.prefix_len must be an integer >= 0")
     if generator.get("attn_pattern", "block_diagonal") != "block_diagonal":
         raise ValueError("attn_pattern must stay block_diagonal")
     if int(generator["n_embd"]) % int(generator["n_head"]) != 0:

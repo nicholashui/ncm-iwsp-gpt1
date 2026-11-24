@@ -175,7 +175,12 @@ def sample_logits(logits: torch.Tensor, temperature=0.0, top_k=0, top_p=1.0) -> 
 
 
 def describe_prefix_run(cfg: dict, options: dict | None = None) -> dict:
-    """Plan a prefix-head run. Does not build modules or read packed windows."""
+    """Plan a prefix-head run. Does not build modules or read packed windows.
+
+    This command stays on the phase-1 guard: ``prefix_len`` 1 and an
+    end-of-text generator prefix. Phase 2 does not retrain the head here.
+    """
+    _phase1_config(cfg)
     options = dict(options or {})
     tokenizer = cfg["tokenizer"]
     generator = cfg["generator"]
@@ -213,8 +218,10 @@ def describe_prefix_run(cfg: dict, options: dict | None = None) -> dict:
             "Phase 1 only. The generator is not fine-tuned and prefix_len stays 1. "
             "The goal is continuation of a short prompt, not a chatbot answer. "
             "If short-prefix level-0 cross-entropy stays near the unigram, this head "
-            "is not enough. That comparison is logged. Phase 2 is a separate change."
+            "is not enough. That comparison is logged. Phase 2 is a separate config "
+            "and does not retrain this head."
         ),
+        "retrain_for_phase2": False,
     }
 
 

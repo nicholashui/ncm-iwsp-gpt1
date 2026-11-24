@@ -30,6 +30,7 @@ import torch
 
 from ncm_iwsp_gpt1.build import build_models, parameter_report
 from ncm_iwsp_gpt1.device import resolve_device
+from ncm_iwsp_gpt1.prefix_protocol import load_generator_state
 
 FORMAT_NAME = "ncm-iwsp-gpt1-from-gradient-checkpoint"
 SCALE_FLOOR = 1e-12
@@ -372,6 +373,9 @@ def convert_files(
         "config_name": str(cfg.get("name", "")),
         "tokenizer": vqvae.state_dict(),
         "generator": generator.state_dict(),
+        "prefix_len": int(generator.prefix_len),
+        "prefix_source": str(generator.prefix_source),
+        "predict_level0": False,
         "report": report,
     }
     torch.save(payload, out_path)
@@ -393,7 +397,7 @@ def load_converted_checkpoint(path: str | Path, vqvae, generator, blob=None) -> 
         )
     try:
         vqvae.load_state_dict(blob["tokenizer"])
-        generator.load_state_dict(blob["generator"])
+        load_generator_state(generator, blob["generator"])
     except (RuntimeError, KeyError) as exc:
         raise ConvertError(f"converted checkpoint does not match these modules: {exc}") from exc
     report = blob.get("report")
