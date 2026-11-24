@@ -13,6 +13,9 @@ runs/
 # Recorded Kaggle fine-tune v3 metric logs (not a corpus dump).
 !artifacts/kaggle-finetune-v3/train_log.jsonl
 !artifacts/kaggle-finetune-v3/val_log.jsonl
+# Recorded Kaggle prefix-level0 v2 metric log and head checkpoint (not a corpus dump).
+!artifacts/kaggle-prefix-level0-v2/train_log.jsonl
+!artifacts/kaggle-prefix-level0-v2/prefix_level0.pt
 *.arrow
 *.parquet
 *.bin

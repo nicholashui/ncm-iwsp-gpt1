@@ -1,0 +1,135 @@
+--- a/ncm_iwsp_gpt1/prefix_level0.py
++++ b/ncm_iwsp_gpt1/prefix_level0.py
+@@ -17,6 +17,7 @@
+ 
+ import json
+ import math
++import time
+ from pathlib import Path
+ 
+ import torch
+@@ -206,6 +207,8 @@
+         "batch_size": int(options.get("batch_size", 8)),
+         "lr": float(options.get("lr", 1e-3)),
+         "max_steps": None if max_steps is None else int(max_steps),
++        "max_hours": options.get("max_hours"),
++        "reserve_minutes": options.get("reserve_minutes"),
+         "writes": "only the --out directory",
+         "does_not_submit_kaggle": True,
+         "packed_windows_not_in_repo": True,
+@@ -508,6 +511,8 @@
+     val_windows: int = 32,
+     grad_clip: float = 1.0,
+     resume=None,
++    max_hours=None,
++    reserve_minutes: float = 15.0,
+ ) -> dict:
+     """Train only the prefix head. Does not submit a job and does not write beside inputs.
+ 
+@@ -610,10 +615,36 @@
+     latest = out / "prefix_level0.pt"
+     last = None
+     short_t = min(4, context_length)
++    reached = int(start)
++    stopped_early = False
++    deadline = None
++    started_at = time.monotonic()
++    if max_hours is not None:
++        if float(max_hours) <= 0:
++            raise PrefixLevel0Error("--max-hours must be positive")
++        deadline = started_at + float(max_hours) * 3600.0 - float(reserve_minutes) * 60.0
++        if deadline <= started_at:
++            raise PrefixLevel0Error("reserve is longer than --max-hours; no time left to train")
+     for step in range(start + 1, int(max_steps) + 1):
++        if deadline is not None and time.monotonic() >= deadline:
++            stopped_early = True
++            print(
++                json.dumps(
++                    {
++                        "event": "time_budget_stop",
++                        "last_step": reached,
++                        "max_steps": int(max_steps),
++                        "max_hours": float(max_hours),
++                        "reserve_minutes": float(reserve_minutes),
++                    }
++                ),
++                flush=True,
++            )
++            break
+         index = torch.randint(0, int(train.shape[0]), (int(batch_size),))
+         tokens = train.index_select(0, index).to(resolved)
+         last = train_step(head, optimizer, vqvae, tokens, grad_clip=float(grad_clip))
++        reached = int(step)
+         _forbid_frozen_grad(vqvae, generator)
+         row = {
+             "step": step,
+@@ -648,6 +679,12 @@
+     val_ce_full = prefix_ce(head, vqvae, val, context_length, batch_size=int(batch_size))
+     val_unigram = unigram_nll(counts, vqvae, val, batch_size=int(batch_size))
+     _forbid_frozen_grad(vqvae, generator)
++    if last is None or reached <= int(start):
++        raise PrefixLevel0Error(
++            "no training step ran. The time budget may be too short, or --max-steps is invalid."
++        )
++    final_step = int(reached)
++
+     if not _params_equal(tokenizer_before, _clone_params(vqvae)):
+         raise PrefixLevel0Error("tokenizer weights changed during prefix-head training")
+     if not _params_equal(generator_before, _clone_params(generator)):
+@@ -663,7 +700,7 @@
+     save_prefix_head(
+         latest,
+         head,
+-        int(max_steps),
++        final_step,
+         embed_dim=embed_dim,
+         codebook_size=codebook_size,
+         context_length=context_length,
+@@ -675,7 +712,12 @@
+         "format": PREFIX_LEVEL0_FORMAT,
+         "checkpoint": str(latest),
+         "log": str(log_path),
+-        "steps": int(max_steps),
++        "steps": final_step,
++        "max_steps": int(max_steps),
++        "stopped_early": bool(stopped_early),
++        "max_hours": None if max_hours is None else float(max_hours),
++        "reserve_minutes": float(reserve_minutes),
++        "elapsed_seconds": float(time.monotonic() - started_at),
+         "resumed_from": start,
+         "last_loss": last["loss"],
+         "last_mean_T": last["mean_T"],
+--- a/ncm_iwsp_gpt1/cli.py
++++ b/ncm_iwsp_gpt1/cli.py
+@@ -436,6 +436,13 @@
+     train_prefix.add_argument("--unigram-windows", type=int, default=256)
+     train_prefix.add_argument("--device", default="auto", help="auto, cuda, or cpu")
+     train_prefix.add_argument("--seed", type=int, default=None)
++    train_prefix.add_argument(
++        "--max-hours",
++        type=float,
++        default=None,
++        help="stop before this wall-clock budget so the final checkpoint and summary can be written",
++    )
++    train_prefix.add_argument("--reserve-minutes", type=float, default=15.0)
+     train_prefix.set_defaults(func=_cmd_train_prefix_level0)
+ 
+     finetune = sub.add_parser(
+@@ -557,6 +564,8 @@
+             "batch_size": args.batch_size,
+             "lr": args.lr,
+             "max_steps": args.max_steps,
++            "max_hours": args.max_hours,
++            "reserve_minutes": args.reserve_minutes,
+         }
+         print(json.dumps(describe_prefix_run(cfg, options), indent=2))
+         return 0
+@@ -588,6 +597,8 @@
+             val_windows=args.val_windows,
+             grad_clip=args.grad_clip,
+             resume=args.resume,
++            max_hours=args.max_hours,
++            reserve_minutes=args.reserve_minutes,
+         )
+     except PrefixLevel0Error as exc:
+         raise SystemExit(str(exc)) from exc

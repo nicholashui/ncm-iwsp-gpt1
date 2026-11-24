@@ -108,7 +108,7 @@ python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
 
 這是延續，不是問答。「How are you?」不是要回「I'm fine」。訓練指令是 `python -m ncm_iwsp_gpt1 train-prefix-level0`，只更新這個頭。`packed_windows.pt` 不在 repo 裡，這裡不啟動長訓練，也不提交 Kaggle。細節在 [`docs/chat.md`](docs/chat.md)。
 
-v3 權重和前綴頭都不在 git 裡。下面的路徑只是例子。
+Kaggle kernel [nicholashuihk/ncm-iwsp-gpt1-prefix-level0](https://www.kaggle.com/code/nicholashuihk/ncm-iwsp-gpt1-prefix-level0) version 2 跑完 20,000 step。前綴頭、指標和 `val_ce_vs_unigram.svg` 在 [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/)。v3 generator 權重仍然不在 git 裡。下面的 tokenizer 和 fine-tune 路徑只是例子。
 
 ```bat
 cd /d e:\Project\ncm-iwsp-gpt1
@@ -120,11 +120,11 @@ cd /d e:\Project\ncm-iwsp-gpt1
   --config configs\target.yaml ^
   --tokenizer E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt ^
   --finetune E:\Project\ncm-iwsp-gpt1-finetune-v3\latest.pt ^
-  --prefix-head E:\Project\ncm-iwsp-gpt1-prefix-level0\prefix_level0.pt ^
+  --prefix-head artifacts\kaggle-prefix-level0-v2\prefix_level0.pt ^
   --prompt "The cat sat"
 ```
 
-`--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The generator prefix stays `<|endoftext|>`. See [`docs/chat.md`](docs/chat.md). v3 weights and the prefix head are not in git.
+`--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The generator prefix stays `<|endoftext|>`. See [`docs/chat.md`](docs/chat.md). The v3 generator is not in git. The prefix head, its metrics, and the val-CE plot are in [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/).
 
 ## 安裝
 
@@ -269,6 +269,9 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 | `docs/convert_from_gradient_checkpoint.md` | 公式、caveat、NicNicNic 與 Kaggle 指令 |
 | `docs/finetune_kaggle.md` | 上傳 init、接上 `artifacts/packed_windows.pt`、T4 預設、loss 怎麼比 |
 | `docs/chat.md` | 前綴頭延續、必要的 checkpoint、以及 packed / unigram 對照 |
+| `kaggle/train_prefix_level0.ipynb` | 前綴頭的 Kaggle notebook。`NICHOLAS_CONFIRMED` 維持 False。子程序帶 `PYTHONPATH`，cwd 是 repo |
+| `patches/time-budget-max-hours.patch` | Kaggle 資料集在 `f35e352` 上加的時間預算。本倉庫的訓練程式沒有套用 |
+| `artifacts/kaggle-prefix-level0-v2/` | version 2 的 `prefix_level0.pt`、指標，和 `val_ce_vs_unigram.svg` |
 | `kaggle/convert_iwsp.py` | 新的 Kaggle notebook 用的轉換腳本，寫入 `/kaggle/working` |
 | `kaggle/convert_iwsp.ipynb` | 同一支腳本的 notebook 版，不提交 Kaggle job |
 | `kaggle/finetune_iwsp.py` | 新的微調腳本，只寫 `/kaggle/working`，需要 `--confirm` |
