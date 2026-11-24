@@ -44,15 +44,31 @@ python -m ncm_iwsp_gpt1 train-prefix-level0 \
 
 `--generator` is optional. When it is passed, the file is loaded and frozen. The loss does not use it. `--tokenizer` is required, because the head reads `encoder.wte` and the level-0 targets come from that tokenizer. The checkpoint written to `--out/prefix_level0.pt` holds the head only (`format` `ncm-iwsp-gpt1-prefix-level0`), not the generator and not the tokenizer. Resume with `--resume` and a larger `--max-steps` (the step to reach, not an extra count).
 
-The log compares validation cross-entropy at prefix lengths 1, 4, and the full window with an add-one unigram of level 0. If the short-prefix number stays near the unigram, this head is not enough. That is phase 2 (a longer generator prefix and a generator fine-tune). Do not go back to tuning the packed-repeat encode. This command does not submit a Kaggle job. A new kernel, if one is opened later, stays separate from `ncm-gpt-1-train`, and `NICHOLAS_CONFIRMED` stays false until someone sets it.
+The log compares validation cross-entropy at prefix lengths 1, 4, and the full window with an add-one unigram of level 0. If the short-prefix number stays near the unigram, this head is not enough. That is phase 2 (a longer generator prefix and a generator fine-tune). Do not go back to tuning the packed-repeat encode. This command does not submit a Kaggle job.
+
+## Kaggle version 2
+
+Kernel [nicholashuihk/ncm-iwsp-gpt1-prefix-level0](https://www.kaggle.com/code/nicholashuihk/ncm-iwsp-gpt1-prefix-level0) version 2 finished this head: 20,000 / 20,000 steps, `stopped_early` false. It started about 07:00:47 HKT on 2026-11-24 and finished about 07:50:43 HKT. Training `elapsed_seconds` is 2915.05. The checkpoint, the metrics, and the plot are in [`artifacts/kaggle-prefix-level0-v2/`](../artifacts/kaggle-prefix-level0-v2/).
+
+| Metric | Value |
+| --- | ---: |
+| `val_ce_T1` | 5.789092779159546 |
+| `val_ce_T4` | 5.4302146434783936 |
+| `val_ce_Tfull` | 5.307143807411194 |
+| `val_unigram_nll` | 7.636285883229613 |
+| `uniform_nll` | 8.317766166719343 |
+
+At step 50, `val_ce_T1` was 7.606337070465088, near the unigram. After 20,000 steps, T=1 is about 1.85 nats below that unigram. [`val_ce_vs_unigram.svg`](../artifacts/kaggle-prefix-level0-v2/val_ce_vs_unigram.svg) is level-0 cross-entropy against the unigram, with final T=4 and T=full markers. It does not overlay token perplexity or a 2018 GPT-1 curve. This is Phase 1 continuation, not a chatbot.
+
+The notebook in this repository is [`kaggle/train_prefix_level0.ipynb`](../kaggle/train_prefix_level0.ipynb). `NICHOLAS_CONFIRMED` stays `False`. Version 1 failed because `python -m ncm_iwsp_gpt1` did not inherit the notebook `sys.path`. The notebook puts the repo on `PYTHONPATH`, runs dry-plan and training with cwd set to the repo root, and exits if a fresh process still cannot import the package. The Kaggle source dataset was commit `f35e352` plus [`patches/time-budget-max-hours.patch`](../patches/time-budget-max-hours.patch). That patch is not applied to the training code in this checkout.
 
 ## Weights for chat
 
-v3 weights and the prefix head are not in this git repository. Download them onto the machine that will run chat.
+The v3 generator is not in this git repository. The prefix head from Kaggle version 2 is [`artifacts/kaggle-prefix-level0-v2/prefix_level0.pt`](../artifacts/kaggle-prefix-level0-v2/prefix_level0.pt) (21,305,039 bytes, sha256 `0ebb615fd9ea29827dd03e4cce24bf06de770178ea869bb0b469d83e70239698`).
 
 | Flags | Role |
 | --- | --- |
-| `--prefix-head prefix_level0.pt` | Required for the default path. Format `ncm-iwsp-gpt1-prefix-level0`. |
+| `--prefix-head artifacts/kaggle-prefix-level0-v2/prefix_level0.pt` | Required for the default path. Format `ncm-iwsp-gpt1-prefix-level0`. |
 | `--tokenizer tokenizer.pt --finetune latest.pt` | Frozen tokenizer plus the fine-tuned generator. Optimizer state in `latest.pt` is ignored. |
 | `--tokenizer tokenizer.pt --generator generator.pt` | Converted init pair, if you are not loading a fine-tune. |
 | `--checkpoint FILE` | One file with format `ncm-iwsp-gpt1-from-gradient-checkpoint`. |
@@ -65,7 +81,7 @@ A tied-head trainer checkpoint is refused. With no tokenizer or generator file, 
 
 ## Commands
 
-Checkout at `e:\Project\ncm-iwsp-gpt1`. The examples assume the venv from the README. Replace the weight paths with the files you actually have. The v3 generator used below is an example path, not a file in git.
+Checkout at `e:\Project\ncm-iwsp-gpt1`. The examples assume the venv from the README. The prefix head below is the file in git. The tokenizer and the v3 generator are example paths, not files in git.
 
 Default path, after the head has been trained:
 
@@ -76,7 +92,7 @@ cd /d e:\Project\ncm-iwsp-gpt1
   --device auto ^
   --tokenizer E:\Project\ncm-iwsp-gpt1-init\tokenizer.pt ^
   --finetune E:\Project\ncm-iwsp-gpt1-finetune-v3\latest.pt ^
-  --prefix-head E:\Project\ncm-iwsp-gpt1-prefix-level0\prefix_level0.pt ^
+  --prefix-head artifacts\kaggle-prefix-level0-v2\prefix_level0.pt ^
   --temperature 0.8 --top-k 40 --top-p 0.9 ^
   --prompt "The cat sat"
 ```

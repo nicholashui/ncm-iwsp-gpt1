@@ -26,15 +26,22 @@ def test_repo_does_not_contain_corpus_or_other_checkouts():
             continue
         if any(part in skip for part in path.parts):
             continue
-        # The Kaggle fine-tune v3 folder commits metric logs, not a corpus.
+        # Recorded Kaggle runs: metric logs, and the prefix-level0 v2 head.
+        # These are not a corpus dump and not an intermediate step checkpoint.
         allowed_jsonl = {
             "artifacts/kaggle-finetune-v3/train_log.jsonl",
             "artifacts/kaggle-finetune-v3/val_log.jsonl",
+            "artifacts/kaggle-prefix-level0-v2/train_log.jsonl",
+        }
+        allowed_pt = {
+            "artifacts/kaggle-prefix-level0-v2/prefix_level0.pt",
         }
         if path.suffix == ".jsonl":
             assert path.as_posix() in allowed_jsonl, path
+        elif path.suffix == ".pt":
+            assert path.as_posix() in allowed_pt, path
         else:
-            assert path.suffix not in {".pt", ".arrow", ".parquet"}, path
+            assert path.suffix not in {".arrow", ".parquet"}, path
         assert "bookcorpus" not in path.name.lower()
         assert path.name not in {
             "pretrain_t2t_mini.jsonl",
