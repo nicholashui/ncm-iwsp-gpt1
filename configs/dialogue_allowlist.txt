@@ -1,0 +1,10 @@
+# Phase 3 dialogue allow-list.
+#
+# No dialogue or instruction corpus is selected. This file ships with no ids.
+# pack-dialogue accepts a dataset id only when that exact id is listed here,
+# one id per line, and the command also receives a license or authorization note.
+# Lines that the book packer already refuses are still refused if they are
+# written here. Do not commit packed windows, checkpoints, or the corpus.
+#
+# Chinese pretraining and Chinese dialogue corpora are not selected.
+# Add an id only after the dataset is chosen outside this repository.

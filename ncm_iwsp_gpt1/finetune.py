@@ -26,6 +26,15 @@ from torch.utils.data import DataLoader, Dataset
 
 from ncm_iwsp_gpt1.build import build_models
 from ncm_iwsp_gpt1.device import resolve_device
+from ncm_iwsp_gpt1.dialogue import (
+    DIALOGUE_FORMAT,
+    DIALOGUE_PACK_FORMAT,
+    DIALOGUE_QUALITY_NOTE,
+    TRUNCATION_POLICY,
+    dialogue_settings,
+    normalize_history_placement,
+)
+from ncm_iwsp_gpt1.packing import refuse_banned_label
 from ncm_iwsp_gpt1.prefix_protocol import (
     batch_prefix_tokens,
     legacy_prefix_warning,
@@ -66,6 +75,10 @@ FORBIDDEN_DIR_NAMES = frozenset(
         "ncm-gpt1-kaggle-100k",
         "ncm-gpt-1-train",
         "kaggle-v10-weights",
+        "ncm-iwsp-gpt1-init",
+        "ncm-iwsp-gpt1-finetune-v3",
+        "ncm-iwsp-gpt1-prefix-level0",
+        "ncm-iwsp-gpt1-finetune-phase2",
     }
 )
 
@@ -162,7 +175,9 @@ def describe_run(cfg: dict, options: dict | None = None) -> dict:
         ],
         "writes": "only the --out directory",
     }
-    if prefix_source == "window":
+    if prefix_source == "window" and not (
+        isinstance(cfg.get("dialogue"), dict) and cfg["dialogue"].get("enabled")
+    ):
         plan["hyperparameter_note"] = (
             "peak_lr, floor_lr, warmup, max_steps, batch_size, grad_accum, "
             "corruption, and validation frequency are the existing finetune CLI "
@@ -170,6 +185,60 @@ def describe_run(cfg: dict, options: dict | None = None) -> dict:
             "not start training. The prefix head is not retrained. A later run "
             "must pass --confirm and must write to a new --out directory."
         )
+    return plan
+
+
+def describe_dialogue_run(cfg: dict, options: dict | None = None) -> dict:
+    """Plan a dialogue fine-tune. Does not build modules and does not train.
+
+    Hyperparameters are the existing finetune CLI defaults. They are not an
+    approved phase-3 recipe. The dataset id is not in the config.
+    """
+    if not isinstance(cfg.get("dialogue"), dict) or not cfg["dialogue"].get("enabled"):
+        raise FinetuneError(
+            "finetune-dialogue needs a phase-3 config with dialogue.enabled true. "
+            "Phase 1 and phase 2 stay on finetune."
+        )
+    plan = describe_run(cfg, options)
+    settings = dialogue_settings(cfg)
+    plan.update(
+        {
+            "dialogue": True,
+            "checkpoint_format": DIALOGUE_FORMAT,
+            "history_placement": settings["history_placement"],
+            "truncation": settings["truncation"],
+            "pad_side": settings["pad_side"],
+            "truncation_policy": TRUNCATION_POLICY,
+            "dataset": None,
+            "dataset_note": (
+                "No dialogue corpus is selected. pack-dialogue and finetune-dialogue "
+                "both require --dataset-id at the command line. The id is not read "
+                "from this config. data.dataset on the phase-3 yaml is unset."
+            ),
+            "retrain_prefix_head": False,
+            "prefix_head_note": (
+                "The prefix head is not retrained. --retrain-prefix-head is an error, "
+                "not a silent skip and not a second training loop."
+            ),
+            "special_role_tokens": False,
+            "code_ce_is_chat_quality": False,
+            "quality_note": DIALOGUE_QUALITY_NOTE,
+            "warm_start": (
+                "Pass a phase-2 generator checkpoint (format ncm-iwsp-gpt1-finetune) "
+                "or a converted generator.pt as --generator, with --resume none. "
+                "Resume continues only a dialogue-format checkpoint in the new --out."
+            ),
+            "hyperparameter_note": (
+                "peak_lr, floor_lr, warmup, max_steps, batch_size, grad_accum, "
+                "corruption, and validation frequency are the existing finetune CLI "
+                "defaults. They are not an approved Phase 3 recipe, and this plan does "
+                "not start training. The tokenizer stays frozen. predict_level0 stays "
+                "false. The prefix head is not retrained. A later run must pass "
+                "--confirm, --dataset-id, and a new --out directory."
+            ),
+            "writes": "only the --out directory",
+        }
+    )
     return plan
 
 
@@ -446,6 +515,11 @@ def load_training_windows(path, context_length: int, val_windows: int) -> tuple[
     if not isinstance(blob, dict):
         raise FinetuneError(f"{path} is not a packed-window dict")
     raw_meta = blob.get("meta") if isinstance(blob.get("meta"), dict) else {}
+    if raw_meta.get("dialogue") or raw_meta.get("format") == DIALOGUE_PACK_FORMAT:
+        raise FinetuneError(
+            f"{path} is a dialogue pack (format {DIALOGUE_PACK_FORMAT}). "
+            "Use finetune-dialogue. The book-window finetune command will not read it."
+        )
     if torch.is_tensor(blob.get("windows")):
         windows = blob["windows"]
         _check_width(windows, context_length, path)
@@ -474,6 +548,90 @@ def load_training_windows(path, context_length: int, val_windows: int) -> tuple[
     return train.contiguous(), val.contiguous(), meta
 
 
+def _check_prefix_rows(prefix, prefix_len, rows, path, label: str) -> None:
+    if (
+        not torch.is_tensor(prefix)
+        or prefix.ndim != 2
+        or int(prefix.shape[0]) != int(rows)
+        or int(prefix.shape[1]) != int(prefix_len)
+    ):
+        shape = tuple(prefix.shape) if torch.is_tensor(prefix) else type(prefix).__name__
+        raise FinetuneError(
+            f"{path} {label} has shape {shape}; expected [{int(rows)}, {int(prefix_len)}]."
+        )
+
+
+def load_dialogue_windows(path, context_length: int, prefix_len: int, dataset_id, placement: str):
+    """Load a ``pack-dialogue`` cache. BookCorpus files are refused.
+
+    The dataset id must be passed again at train time. It is not taken from a
+    config default. Hidden rows are not returned.
+    """
+    path = Path(path)
+    blob = _read_blob(path)
+    if not isinstance(blob, dict):
+        raise FinetuneError(f"{path} is not a dialogue-window dict")
+    raw_meta = blob.get("meta") if isinstance(blob.get("meta"), dict) else {}
+    if raw_meta.get("format") != DIALOGUE_PACK_FORMAT or not raw_meta.get("dialogue"):
+        raise FinetuneError(
+            f"{path} is not a pack-dialogue cache. BookCorpus packed windows stay on finetune. "
+            "finetune-dialogue does not default to a corpus."
+        )
+    if not str(raw_meta.get("license_note", "")).strip():
+        raise FinetuneError(f"{path} is missing a license or authorization note")
+    if raw_meta.get("special_role_tokens") or raw_meta.get("add_special_role_tokens"):
+        raise FinetuneError(
+            f"{path} requested special role tokens. This build keeps GPT-2 BPE and encoder.wte unchanged."
+        )
+    wanted = str(dataset_id or "").strip()
+    if not wanted:
+        raise FinetuneError("finetune-dialogue needs --dataset-id. No dialogue corpus is selected.")
+    try:
+        refuse_banned_label(wanted)
+    except ValueError as exc:
+        raise FinetuneError(str(exc)) from exc
+    found_id = str(raw_meta.get("dataset", "")).strip()
+    if found_id != wanted:
+        raise FinetuneError(
+            f"packed dataset id {found_id!r} does not match --dataset-id {wanted!r}."
+        )
+    found_placement = normalize_history_placement(raw_meta.get("history_placement"))
+    if found_placement != normalize_history_placement(placement):
+        raise FinetuneError(
+            f"packed history_placement {found_placement!r} does not match the config "
+            f"({normalize_history_placement(placement)!r}). Repack, or set the config to that placement."
+        )
+    if int(raw_meta.get("context_length", context_length)) != int(context_length):
+        raise FinetuneError(
+            f"{path} context_length {raw_meta.get('context_length')} does not match {int(context_length)}"
+        )
+    if int(raw_meta.get("prefix_len", -1)) != int(prefix_len):
+        raise FinetuneError(
+            f"{path} prefix_len {raw_meta.get('prefix_len')} does not match {int(prefix_len)}"
+        )
+    if not (torch.is_tensor(blob.get("visible_train")) and torch.is_tensor(blob.get("visible"))):
+        raise FinetuneError(f"{path} needs visible_train and visible windows")
+    train = blob["visible_train"]
+    val = blob["visible"]
+    train_prefix = blob.get("prefix_visible_train")
+    val_prefix = blob.get("prefix_visible")
+    _check_width(train, context_length, path)
+    _check_width(val, context_length, path)
+    _check_prefix_rows(train_prefix, prefix_len, train.shape[0], path, "prefix_visible_train")
+    _check_prefix_rows(val_prefix, prefix_len, val.shape[0], path, "prefix_visible")
+    if int(train.shape[0]) < 1 or int(val.shape[0]) < 1:
+        raise FinetuneError(f"{path} needs non-empty visible_train and visible tensors")
+    meta = {"kind": "dialogue_windows", "path": str(path)}
+    meta.update(_jsonable(raw_meta))
+    return (
+        train.contiguous(),
+        val.contiguous(),
+        train_prefix.contiguous(),
+        val_prefix.contiguous(),
+        meta,
+    )
+
+
 class _WindowDataset(Dataset):
     def __init__(self, windows: torch.Tensor):
         self.windows = windows
@@ -483,6 +641,22 @@ class _WindowDataset(Dataset):
 
     def __getitem__(self, index):
         return self.windows[index].long()
+
+
+class _PrefixWindowDataset(Dataset):
+    """Window tokens plus an explicit generator prefix. Dialogue runs only."""
+
+    def __init__(self, windows: torch.Tensor, prefixes: torch.Tensor):
+        if int(windows.shape[0]) != int(prefixes.shape[0]):
+            raise FinetuneError("dialogue prefix rows do not match windows")
+        self.windows = windows
+        self.prefixes = prefixes
+
+    def __len__(self):
+        return int(self.windows.shape[0])
+
+    def __getitem__(self, index):
+        return self.windows[index].long(), self.prefixes[index].long()
 
 
 def _optimizer_to_device(optimizer, device: torch.device) -> None:
@@ -501,8 +675,12 @@ def _make_loader(
     workers: int,
     pin: bool,
     shuffle: bool = True,
+    prefixes=None,
 ):
-    dataset = _WindowDataset(windows)
+    if prefixes is None:
+        dataset = _WindowDataset(windows)
+    else:
+        dataset = _PrefixWindowDataset(windows, prefixes)
     if len(dataset) < int(batch_size):
         raise FinetuneError(
             f"need at least {int(batch_size)} windows on this rank's loader, found {len(dataset)}"
@@ -611,6 +789,27 @@ def _unwrap(model):
     return getattr(model, "module", model)
 
 
+def _batch_tensors(batch, device):
+    """A book batch is a token tensor. A dialogue batch is ``(tokens, prefix)``."""
+    prefix = None
+    if (
+        isinstance(batch, (list, tuple))
+        and len(batch) == 2
+        and torch.is_tensor(batch[0])
+        and torch.is_tensor(batch[1])
+    ):
+        tokens, prefix = batch
+    elif torch.is_tensor(batch):
+        tokens = batch
+    else:
+        raise FinetuneError("a fine-tune batch must be a token tensor or (tokens, prefix)")
+    non_blocking = device.type == "cuda"
+    tokens = tokens.to(device, non_blocking=non_blocking)
+    if prefix is not None:
+        prefix = prefix.to(device, non_blocking=non_blocking)
+    return tokens, prefix
+
+
 def _prepare_batch(
     vqvae,
     generator,
@@ -620,6 +819,7 @@ def _prepare_batch(
     p_max: float,
     p_min: float,
     pad_id: int,
+    prefix_tokens=None,
 ):
     with torch.no_grad():
         indices = vqvae.encode(tokens)
@@ -629,14 +829,25 @@ def _prepare_batch(
         if corrupt and (float(p_max) > 0.0 or float(p_min) > 0.0):
             source = corrupt_codes(indices, levels, vocabs, p_max, p_min)
         latent = vqvae.vq.idx_to_ncm_input(source)
-        prefix = batch_prefix_tokens(
-            tokens,
-            int(generator.prefix_len),
-            generator.prefix_source,
-            int(eos_id),
-            int(pad_id),
-        )
+        if prefix_tokens is None:
+            prefix = batch_prefix_tokens(
+                tokens,
+                int(generator.prefix_len),
+                generator.prefix_source,
+                int(eos_id),
+                int(pad_id),
+            )
+        else:
+            prefix = prefix_tokens.to(dtype=torch.long)
+            if prefix.ndim != 2 or int(prefix.shape[0]) != int(tokens.shape[0]):
+                raise FinetuneError("dialogue prefix batch does not match the token batch")
+            if int(prefix.shape[1]) != int(generator.prefix_len):
+                raise FinetuneError(
+                    f"dialogue prefix width {int(prefix.shape[1])} != "
+                    f"prefix_len {int(generator.prefix_len)}"
+                )
         teacher = torch.cat([vqvae.encoder.wte(prefix), latent], dim=1)
+        # Level 0 stays out of the generator targets.
         targets = indices[:, levels[0] :]
     return teacher, targets, levels[1:], vocabs[1:]
 
@@ -806,7 +1017,7 @@ def _evaluate(vqvae, generator, loader, device, eos_id, pad_id, alpha, mid_aux, 
     elbo = 0.0
     rows = 0
     for batch in loader:
-        tokens = batch.to(device, non_blocking=device.type == "cuda")
+        tokens, prefix_batch = _batch_tensors(batch, device)
         teacher, targets, levels, vocabs = _prepare_batch(
             vqvae,
             generator,
@@ -816,6 +1027,7 @@ def _evaluate(vqvae, generator, loader, device, eos_id, pad_id, alpha, mid_aux, 
             p_max=0.0,
             p_min=0.0,
             pad_id=pad_id,
+            prefix_tokens=prefix_batch,
         )
         with torch.no_grad():
             with autocast:
@@ -886,8 +1098,36 @@ def run_finetune(
     chunked_block_attn: bool = True,
     workers: int = DEFAULT_WORKERS,
     seed: int | None = None,
+    dialogue: bool = False,
+    dataset_id: str | None = None,
+    retrain_prefix_head: bool = False,
 ) -> dict:
-    """Fine-tune the generator from a converted init. Tokenizer weights stay fixed."""
+    """Fine-tune the generator from a converted init. Tokenizer weights stay fixed.
+
+    ``dialogue=True`` is the phase-3 path: a pack-dialogue cache, an explicit
+    dataset id, and no prefix-head update. The book-window path leaves
+    ``dialogue`` false.
+    """
+    if retrain_prefix_head:
+        raise FinetuneError(
+            "the prefix head is not retrained. "
+            "finetune-dialogue leaves it frozen. "
+            "--retrain-prefix-head is an error, not a silent retrain."
+        )
+    if dialogue:
+        if not isinstance(cfg.get("dialogue"), dict) or not cfg["dialogue"].get("enabled"):
+            raise FinetuneError(
+                "finetune-dialogue needs a phase-3 config with dialogue.enabled true."
+            )
+        if not str(dataset_id or "").strip():
+            raise FinetuneError(
+                "finetune-dialogue needs --dataset-id. No dialogue corpus is selected."
+            )
+    elif isinstance(cfg.get("dialogue"), dict) and cfg["dialogue"].get("enabled"):
+        raise FinetuneError(
+            "this config enables dialogue. Use finetune-dialogue, which requires a dataset id "
+            "and does not retrain the prefix head. The finetune command stays the book-window path."
+        )
     sources = [tokenizer_path, generator_path, packed_path]
     refuse_finetune_output(out_dir, sources)
     out = Path(out_dir)
@@ -931,6 +1171,9 @@ def run_finetune(
             chunked_block_attn=bool(chunked_block_attn),
             workers=int(workers),
             seed=seed,
+            dialogue=bool(dialogue),
+            dataset_id=None if dataset_id is None else str(dataset_id),
+            retrain_prefix_head=False,
         )
     finally:
         _cleanup_process(started_dist)
@@ -977,10 +1220,27 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
             torch.set_float32_matmul_precision("high")
 
     context = int(cfg["tokenizer"]["context_length"])
-    train_windows, val_windows, packed_meta = load_training_windows(
-        packed_path, context, opt["val_windows"]
-    )
-    plan = describe_run(cfg, opt)
+    train_prefix = None
+    val_prefix = None
+    if opt.get("dialogue"):
+        settings = dialogue_settings(cfg)
+        train_windows, val_windows, train_prefix, val_prefix, packed_meta = load_dialogue_windows(
+            packed_path,
+            context,
+            int(cfg["generator"]["prefix_len"]),
+            opt.get("dataset_id"),
+            settings["history_placement"],
+        )
+        plan = describe_dialogue_run(cfg, opt)
+        plan["dataset"] = packed_meta.get("dataset")
+        plan["history_placement"] = packed_meta.get("history_placement")
+    else:
+        train_windows, val_windows, packed_meta = load_training_windows(
+            packed_path, context, opt["val_windows"]
+        )
+        plan = describe_run(cfg, opt)
+    checkpoint_format = DIALOGUE_FORMAT if opt.get("dialogue") else FINETUNE_FORMAT
+    quality_note = DIALOGUE_QUALITY_NOTE if opt.get("dialogue") else None
     plan.update(
         {
             "device": str(device),
@@ -1048,7 +1308,14 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
         resume_blob = _read_blob(Path(resume_path))
         if not isinstance(resume_blob, dict) or not isinstance(resume_blob.get("model"), dict):
             raise FinetuneError(f"{resume_path} has no generator model to resume")
-        if resume_blob.get("format") not in {None, FINETUNE_FORMAT}:
+        if opt.get("dialogue"):
+            if resume_blob.get("format") != DIALOGUE_FORMAT:
+                raise FinetuneError(
+                    f"{resume_path} format is {resume_blob.get('format')!r}. "
+                    f"Dialogue resume expects {DIALOGUE_FORMAT}. "
+                    "A phase-2 file is a warm start: pass it as --generator with --resume none."
+                )
+        elif resume_blob.get("format") not in {None, FINETUNE_FORMAT}:
             raise FinetuneError(
                 f"{resume_path} format is {resume_blob.get('format')!r}. "
                 f"Resume expects {FINETUNE_FORMAT}."
@@ -1074,6 +1341,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
         world_size,
         opt["workers"],
         pin,
+        prefixes=train_prefix,
     )
     val_loader, _ = _make_loader(
         val_windows,
@@ -1084,6 +1352,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
         0,
         pin,
         shuffle=False,
+        prefixes=val_prefix,
     )
     batches = _forever(train_loader, train_sampler)
     autocast, scaler, amp_name = setup_amp(device)
@@ -1091,6 +1360,8 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
         scaler.load_state_dict(scaler_state)
     if main:
         print(f"amp={amp_name}  device={device}  world_size={world_size}", flush=True)
+        if quality_note:
+            print(quality_note, flush=True)
 
     net = generator
     if world_size > 1:
@@ -1115,7 +1386,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
             return
         module = _unwrap(net)
         payload = {
-            "format": FINETUNE_FORMAT,
+            "format": checkpoint_format,
             "model": module.state_dict(),
             "step": int(step),
             "optimizer": optimizer.state_dict(),
@@ -1143,6 +1414,15 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                 "gradient_checkpointing": bool(opt["gradient_checkpointing"]),
             },
         }
+        if opt.get("dialogue"):
+            payload["dialogue"] = True
+            payload["retrain_prefix_head"] = False
+            payload["history_placement"] = packed_meta.get("history_placement")
+            payload["dataset"] = packed_meta.get("dataset")
+            payload["code_ce_is_chat_quality"] = False
+            payload["quality_note"] = quality_note
+            payload["tokenizer_frozen"] = True
+            payload["predict_level0"] = False
         _atomic_save(out / "latest.pt", payload)
         if int(step) > 0:
             _atomic_save(out / f"generator_step{int(step)}.pt", payload)
@@ -1153,7 +1433,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                 "step": int(step),
                 "max_steps": max_steps,
                 "finished": bool(finished),
-                "stage": FINETUNE_FORMAT,
+                "stage": checkpoint_format,
                 "loss_comparable_to_alpha0": comparable,
                 "loss_note": note,
             },
@@ -1185,6 +1465,9 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                     "mid_aux": float(opt["mid_aux"]),
                     **metrics,
                 }
+                if quality_note:
+                    record["quality_note"] = quality_note
+                    record["code_ce_is_chat_quality"] = False
                 _append_jsonl(out / "val_log.jsonl", record)
                 print(
                     f"val step {step}  loss={metrics['val_loss']:.4f}  "
@@ -1213,7 +1496,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
         save(start_step, True)
         return _summary(
             start_step, start_step, True, out, tok_checksum, tok_checksum, gen_checksum, gen_checksum,
-            comparable, note, resume_path, gen_meta,
+            comparable, note, resume_path, gen_meta, checkpoint_format,
         )
 
     net.train()
@@ -1230,7 +1513,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
             last_stats = None
             accum = max(int(opt["grad_accum"]), 1)
             for micro in range(accum):
-                tokens = next(batches).to(device, non_blocking=pin)
+                tokens, prefix_batch = _batch_tensors(next(batches), device)
                 teacher, targets, levels, vocabs = _prepare_batch(
                     vqvae,
                     _unwrap(net),
@@ -1240,6 +1523,7 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
                     p_max=opt["corrupt_p_max"],
                     p_min=opt["corrupt_p_min"],
                     pad_id=int(pretok.pad_token_id),
+                    prefix_tokens=prefix_batch,
                 )
                 sync = micro == accum - 1
                 with _sync_context(net, sync):
@@ -1266,20 +1550,21 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
             if main and last_stats is not None and (
                 step == start_step + 1 or step % max(int(opt["log_every"]), 1) == 0
             ):
-                _append_jsonl(
-                    out / "train_log.jsonl",
-                    {
-                        "step": step,
-                        "lr": lr,
-                        "alpha": float(opt["alpha"]),
-                        "mid_aux": float(opt["mid_aux"]),
-                        "loss_comparable_to_alpha0": comparable,
-                        "loss_note": note,
-                        "mem_gb": _cuda_mem_gb(),
-                        "amp": amp_name,
-                        **last_stats,
-                    },
-                )
+                train_record = {
+                    "step": step,
+                    "lr": lr,
+                    "alpha": float(opt["alpha"]),
+                    "mid_aux": float(opt["mid_aux"]),
+                    "loss_comparable_to_alpha0": comparable,
+                    "loss_note": note,
+                    "mem_gb": _cuda_mem_gb(),
+                    "amp": amp_name,
+                    **last_stats,
+                }
+                if quality_note:
+                    train_record["quality_note"] = quality_note
+                    train_record["code_ce_is_chat_quality"] = False
+                _append_jsonl(out / "train_log.jsonl", train_record)
                 print(
                     f"step {step}/{max_steps}  loss={last_stats['loss']:.4f}  "
                     f"ce_first/mid/last="
@@ -1316,15 +1601,15 @@ def _run_on_process(cfg, tokenizer_path, generator_path, packed_path, out, devic
     tok_end = _checksum(vqvae)
     return _summary(
         start_step, step, finished, out, tok_checksum, tok_end, gen_checksum, gen_end,
-        comparable, note, resume_path, gen_meta,
+        comparable, note, resume_path, gen_meta, checkpoint_format,
     )
 
 
 def _summary(
     start_step, step, finished, out, tok_start, tok_end, gen_start, gen_end,
-    comparable, note, resume_path, gen_meta,
+    comparable, note, resume_path, gen_meta, checkpoint_format=FINETUNE_FORMAT,
 ) -> dict:
-    return {
+    summary = {
         "start_step": int(start_step),
         "step": int(step),
         "finished": bool(finished),
@@ -1338,5 +1623,38 @@ def _summary(
         "loss_note": note,
         "init_step": gen_meta.get("step"),
         "converted_from": _jsonable(gen_meta.get("converted_from")),
-        "format": FINETUNE_FORMAT,
+        "format": checkpoint_format,
     }
+    if checkpoint_format == DIALOGUE_FORMAT:
+        summary["retrain_prefix_head"] = False
+    return summary
+
+
+def run_dialogue_finetune(
+    cfg,
+    tokenizer_path,
+    generator_path,
+    packed_path,
+    out_dir,
+    *,
+    dataset_id: str,
+    retrain_prefix_head: bool = False,
+    **kwargs,
+) -> dict:
+    """Phase-3 generator fine-tune. The prefix head is not updated.
+
+    ``dataset_id`` is required and must match the pack-dialogue cache. The
+    generator warm-start is whatever ``--generator`` points at, typically a
+    phase-2 checkpoint. Writes only go to ``out_dir``.
+    """
+    return run_finetune(
+        cfg,
+        tokenizer_path,
+        generator_path,
+        packed_path,
+        out_dir,
+        dialogue=True,
+        dataset_id=dataset_id,
+        retrain_prefix_head=bool(retrain_prefix_head),
+        **kwargs,
+    )
