@@ -26,6 +26,16 @@ import torch
 from ncm_iwsp_gpt1.build import build_models, lock_for_eval
 from ncm_iwsp_gpt1.convert import FORMAT_NAME, ConvertError, load_converted_checkpoint
 from ncm_iwsp_gpt1.device import resolve_device
+from ncm_iwsp_gpt1.dialogue import (
+    DIALOGUE_FORMAT,
+    DialogueError,
+    checkpoint_is_dialogue,
+    dialogue_settings,
+    encode_turns,
+    inference_prefix_ids,
+    render_transcript,
+    slice_reply,
+)
 from ncm_iwsp_gpt1.prefix_level0 import (
     PREFIX_LEVEL0_FORMAT,
     PrefixLevel0Error,
@@ -103,6 +113,13 @@ Turns are independent: the previous reply is not fed back. temperature 0 is
 argmax. top_k 0 and top_p 1 disable truncation. This is continuation, not a
 chatbot reply.
 
+Phase 3 is off unless --dialogue is passed with a phase-3 config and a
+generator checkpoint of format ncm-iwsp-gpt1-dialogue. Only that combination
+keeps history and may call the session the chatbot path. The printed line is
+then a slice of the decoded window. The window itself remains the text to
+score. No dialogue corpus is selected in this repository. Without those
+flags, phase 1 and phase 2 behave as they do above.
+
 Weights, including v3 and the prefix head, are not in this git repository.
 Layouts loaded as-is:
   --checkpoint FILE
@@ -159,9 +176,19 @@ class ChatSession:
         self.unigram_probs = unigram_probs
         self.level0_detail = str(level0_detail)
         self.prefix_warning = ""
+        # Phase 3 fields stay off unless open_session is asked for dialogue.
+        self.dialogue = False
+        self.history = None
+        self.history_placement = None
+        self.user_marker = "User"
+        self.assistant_marker = "Assistant"
+        self.system_marker = "System"
+        self.max_reply_tokens = 0
 
     def reply(self, text: str) -> dict:
         """Sample level 0 for ``text``, then finer codes, and decode one window."""
+        if self.dialogue:
+            return self._dialogue_reply(text)
         if not isinstance(text, str):
             raise ChatError("prompt must be a string")
         with torch.no_grad():
@@ -201,6 +228,111 @@ class ChatSession:
         packed["level0"] = [int(value) for value in level0[0].tolist()]
         packed["level0_source"] = self.level0_source
         return packed
+
+    def _dialogue_reply(self, text: str) -> dict:
+        """One dialogue turn: history in the prefix and/or the conditioning text.
+
+        ``text`` and ``display_text`` are the sliced reply. ``decoded_window``
+        is the full model window and is the text to score. History stores the
+        sliced reply, not the rest of the window.
+        """
+        if not isinstance(text, str) or not text.strip():
+            raise ChatError("dialogue mode needs a non-empty user turn")
+        user_text = text.strip()
+        turns = list(self.history or []) + [{"role": "user", "content": user_text}]
+        try:
+            cond_ids = encode_turns(
+                self.pretok,
+                turns,
+                self.user_marker,
+                self.assistant_marker,
+                self.system_marker,
+            )
+            built = inference_prefix_ids(
+                cond_ids,
+                context_length=self.context_length,
+                prefix_len=self.prefix_len,
+                placement=self.history_placement,
+                pad_id=int(self.pretok.pad_token_id),
+            )
+        except DialogueError as exc:
+            raise ChatError(str(exc)) from exc
+        if not built["head_ids"]:
+            raise ChatError("the dialogue turn encoded to no tokens")
+        with torch.no_grad():
+            if self.level0_source == "packed":
+                packed = pack_prompt_window(self.pretok, user_text, self.context_length)
+                tokens = torch.tensor([packed["window_ids"]], dtype=torch.long, device=self.device)
+                level0 = self.vqvae.encode(tokens)[:, : self.level0_len]
+                repeated = True
+                truncated = bool(packed["truncated"])
+            elif self.level0_source == "prefix_head":
+                level0 = self._level0_from_head(built["head_ids"])
+                repeated = False
+                truncated = bool(built["history_dropped"])
+            elif self.level0_source == "unigram":
+                level0 = self._level0_from_unigram()
+                repeated = False
+                truncated = bool(built["history_dropped"])
+            else:
+                raise ChatError(f"unknown level0_source {self.level0_source!r}")
+            prefix_ids = list(built["prefix_ids"])
+            if self.prefix_len:
+                prefix = torch.tensor([prefix_ids], dtype=torch.long, device=self.device)
+            else:
+                prefix = torch.empty(1, 0, dtype=torch.long, device=self.device)
+            decoded_ids = self._decode_ids(level0, prefix)
+        decoded = self.pretok.decode(decoded_ids, skip_special_tokens=True)
+        conditioning = render_transcript(
+            turns, self.user_marker, self.assistant_marker, self.system_marker
+        )
+        try:
+            sliced = slice_reply(
+                decoded,
+                conditioning,
+                current_user_line=f"{self.user_marker}: {user_text}",
+                user_marker=self.user_marker,
+                assistant_marker=self.assistant_marker,
+                pretok=self.pretok,
+                max_reply_tokens=int(self.max_reply_tokens),
+            )
+        except DialogueError as exc:
+            raise ChatError(str(exc)) from exc
+        reply = sliced["reply"]
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": reply})
+        pad = int(self.pretok.pad_token_id)
+        return {
+            "window_ids": list(built["head_ids"]),
+            "prompt_ids": list(built["head_ids"]),
+            "truncated": bool(truncated),
+            "repeated": bool(repeated),
+            "prompt_tokens": len(built["head_ids"]),
+            "encoded_pad": sum(token == pad for token in prefix_ids),
+            "context_length": self.context_length,
+            "prefix_ids": prefix_ids,
+            "prefix_len": len(prefix_ids),
+            "prefix_source": self.prefix_source,
+            "prefix_pad": sum(token == pad for token in prefix_ids),
+            "decoded_window": decoded,
+            "text": reply,
+            "display_text": reply,
+            "reply_text": reply,
+            "prompt_prepended": False,
+            "level0": [int(value) for value in level0[0].tolist()],
+            "level0_source": self.level0_source,
+            "dialogue": True,
+            "history_placement": self.history_placement,
+            "history_turns": len(self.history),
+            "history_dropped": int(built["history_dropped"]),
+            "stripped_overlap": bool(sliced["stripped_overlap"]),
+            "cut_at_user_marker": bool(sliced["cut_at_user_marker"]),
+            "conditioning_text": conditioning,
+        }
+
+    def clear_history(self) -> None:
+        if self.history is not None:
+            self.history.clear()
 
     def _level0_from_head(self, prompt_ids: list[int]) -> torch.Tensor:
         if self.prefix_head is None:
@@ -264,6 +396,8 @@ def open_session(
     level0_source: str = "prefix_head",
     packed_path: str | Path | None = None,
     unigram_max_windows: int = 256,
+    dialogue: bool = False,
+    max_reply_tokens: int = 0,
 ) -> ChatSession:
     """Build the modules, optionally load weights, and move them to ``device``.
 
@@ -278,6 +412,19 @@ def open_session(
     )
     resolved = resolve_device(device)
     prepared = prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path)
+    dialogue_settings_block = None
+    if dialogue:
+        try:
+            dialogue_settings_block = dialogue_settings(cfg)
+        except DialogueError as exc:
+            raise ChatError(str(exc)) from exc
+        if prepared is None or not checkpoint_is_dialogue(prepared.generator_meta):
+            raise ChatError(
+                "refusing dialogue mode without a dialogue checkpoint "
+                f"(format {DIALOGUE_FORMAT}) passed as --finetune. "
+                "This session will not call itself a chatbot or a Q&A model. "
+                "A phase-1 or phase-2 checkpoint stays on the continuation path."
+            )
     pretok, vqvae, generator = build_models(cfg)
     prefix_warning = ""
     if prepared is not None:
@@ -362,11 +509,33 @@ def open_session(
         level0_detail,
     )
     session.prefix_warning = prefix_warning
+    if dialogue_settings_block is not None:
+        session.dialogue = True
+        session.history = []
+        session.history_placement = dialogue_settings_block["history_placement"]
+        session.user_marker = dialogue_settings_block["user_marker"]
+        session.assistant_marker = dialogue_settings_block["assistant_marker"]
+        session.system_marker = dialogue_settings_block["system_marker"]
+        session.max_reply_tokens = int(max_reply_tokens)
     return session
 
 
 def startup_message(session: ChatSession) -> str:
-    if session.prefix_source == "window":
+    if getattr(session, "dialogue", False):
+        first = (
+            f"{session.config_name}: context {session.context_length}, "
+            f"prefix_len {session.prefix_len}, device {session.device}. "
+            f"Not a causal LM. level0_source={session.level0_source}. "
+            "Dialogue checkpoint loaded. This session is the chatbot path: "
+            "history is kept and the printed text is a slice of the decoded window. "
+            f"history_placement={session.history_placement}. "
+            "Truncation keeps the newest tokens (drop from the left) and right-pads "
+            f"with pad id {int(session.pretok.pad_token_id)}. "
+            "The scored text is still the full decoded window. "
+            "Code cross-entropy is not a Q&A score. "
+            "The prefix head was not retrained by the dialogue fine-tune."
+        )
+    elif session.prefix_source == "window":
         first = (
             f"{session.config_name}: context {session.context_length}, "
             f"prefix_len {session.prefix_len}, device {session.device}. "
@@ -413,7 +582,7 @@ def format_note(result: dict) -> str:
     truncated = "yes" if result["truncated"] else "no"
     repeated = "yes" if result["repeated"] else "no"
     prepended = "yes" if result.get("prompt_prepended") else "no"
-    return (
+    text = (
         f"level0_source={result['level0_source']} "
         f"level0={level0} prefix={prefix} "
         f"prefix_source={result.get('prefix_source', 'eos')} "
@@ -422,6 +591,13 @@ def format_note(result: dict) -> str:
         f"repeated={repeated} truncated={truncated} "
         f"prompt_prepended={prepended}"
     )
+    if result.get("dialogue"):
+        text += (
+            f" dialogue=yes history={result.get('history_placement')} "
+            f"history_turns={result.get('history_turns')} "
+            f"reply_chars={len(result.get('reply_text') or '')}"
+        )
+    return text
 
 
 def run_prompt(session: ChatSession, text: str) -> int:
@@ -434,7 +610,10 @@ def run_prompt(session: ChatSession, text: str) -> int:
 
 def run_interactive(session: ChatSession) -> int:
     print(startup_message(session), file=sys.stderr, flush=True)
-    print("Type a prompt. Quit with quit, exit, /quit, or /exit.", file=sys.stderr, flush=True)
+    hint = "Type a prompt. Quit with quit, exit, /quit, or /exit."
+    if session.dialogue:
+        hint += " History is kept. /clear drops it."
+    print(hint, file=sys.stderr, flush=True)
     while True:
         try:
             line = input("you> ")
@@ -446,6 +625,10 @@ def run_interactive(session: ChatSession) -> int:
             return 130
         if is_quit(line):
             return 0
+        if session.dialogue and line.strip().lower() == "/clear":
+            session.clear_history()
+            print("history cleared", file=sys.stderr, flush=True)
+            continue
         if not line.strip():
             continue
         result = session.reply(line)
@@ -504,10 +687,10 @@ def prepare_weights(checkpoint, tokenizer_path, generator_path, finetune_path):
     gen_blob = _read_blob(gen_file)
     if finetune_path is not None:
         found = gen_blob.get("format") if isinstance(gen_blob, dict) else None
-        if found != FINETUNE_FORMAT:
+        if found not in {FINETUNE_FORMAT, DIALOGUE_FORMAT}:
             raise ChatError(
                 f"{finetune_path} format is {found!r}. "
-                f"--finetune expects {FINETUNE_FORMAT}. "
+                f"--finetune expects {FINETUNE_FORMAT} or, for phase 3, {DIALOGUE_FORMAT}. "
                 "The model entry is loaded into the generator; optimizer state is ignored."
             )
     gen_state, gen_meta = _as_state(gen_blob, "generator")

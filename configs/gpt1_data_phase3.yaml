@@ -1,0 +1,71 @@
+# Small phase-3 config. Same runnable body as configs/gpt1_data_phase2.yaml.
+# prefix_len is 8, matching the small phase-2 file, so a phase-2 generator
+# checkpoint can warm-start. This file does not select a dialogue corpus
+# (data.dataset is unset) and it does not train.
+#
+# history_placement both: the generator prefix is the tail of the conditioning
+# turns, and the reconstructed window is the dialogue, left-truncated
+# (keep_tail) and right-padded with pad id 50257. prefix and window are the
+# other legal values. Role markers are plain text. Special role tokens stay off.
+name: NCM-iWSP-GPT1-runnable-phase3
+seed: 0
+heavy: false
+
+pretok:
+  kind: gpt2
+  pad_vocab_to: 50304
+
+tokenizer:
+  embed_dim: 32
+  context_length: 32
+  n_heads: 4
+  dropout: 0.0
+  enc_layers: 0
+  dec_layers: 1
+  use_qk_norm: true
+  pre_quant_groupnorm: 8
+  codebook_size: 64
+  levels: [1, 4, 9, 16, 25, 32]
+  learned_l1_sampling: true
+  learned_l1_cascade: true
+  learned_l1_cascade_base: 4
+  quant_resi:
+    enabled: true
+    ratio: 0.5
+
+generator:
+  n_layer: 2
+  n_head: 4
+  n_embd: 32
+  bias: true
+  dropout: 0.0
+  prefix_len: 8
+  prefix_source: window
+  rope_base: 100000
+  use_rope: true
+  use_level_encoding: true
+  use_qk_norm: true
+  attn_pattern: block_diagonal
+  predict_level0: false
+
+dialogue:
+  enabled: true
+  history_placement: both
+  truncation: keep_tail
+  pad_side: right
+  user_marker: User
+  assistant_marker: Assistant
+  system_marker: System
+  add_special_role_tokens: false
+
+data:
+  dataset: "unset"
+  hidden_pct: 10
+  visible_pct: 10
+  max_windows: 32
+
+eval:
+  batch_size: 2
+  max_windows: 4
+  n_generate: 1
+  device: auto

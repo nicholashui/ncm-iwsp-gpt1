@@ -6,8 +6,10 @@ tokenizer, no post-upsample convolution. ``ncm_iwsp_gpt1.prefix_level0``
 trains only a level-0 head on frozen tokenizer embeddings. It leaves
 ``predict_level0`` false and ``prefix_len`` at 1. Phase 2 is a separate
 config (``configs/target_phase2.yaml``): a longer prefix filled with real
-tokens. The default configs stay phase 1. The gradient BookCorpus model with
-tied heads remains NCM-GPT1 in nicholashui/ncm-gpt1.
+tokens. Phase 3 (``configs/target_phase3.yaml``) is an opt-in dialogue pack
+and fine-tune. No dialogue corpus is selected. The default configs stay
+phase 1. The gradient BookCorpus model with tied heads remains NCM-GPT1 in
+nicholashui/ncm-gpt1.
 """
 
 __version__ = "0.1.0"

@@ -1,0 +1,74 @@
+# Phase-3 NCM-iWSP-GPT1 target. Same 12/768/12 body as configs/target_phase2.yaml.
+# CI estimates this file; it does not instantiate it and it does not train.
+#
+# prefix_len 32 matches phase 2 so a phase-2 generator checkpoint can warm-start.
+# Sequence length is 32 + 4306 = 4338. prefix_len 64 would be 4370. Switch by
+# editing prefix_len. Mask and RoPE buffers are rebuilt; wte, blocks, and
+# lm_heads keep their shapes. predict_level0 stays false.
+#
+# No dialogue corpus is selected. data.dataset is unset on purpose. The id is
+# required on pack-dialogue and finetune-dialogue. history_placement both is
+# the config value, not a tuned recipe: prefix and window are also valid.
+name: NCM-iWSP-GPT1-phase3
+seed: 0
+heavy: true
+
+pretok:
+  kind: gpt2
+  pad_vocab_to: 50304
+
+tokenizer:
+  embed_dim: 384
+  context_length: 512
+  n_heads: 6          # official configs call this n_layers; it is the head count
+  dropout: 0.0
+  enc_layers: 0
+  dec_layers: 1
+  use_qk_norm: true
+  pre_quant_groupnorm: 8
+  codebook_size: 4096
+  # 1^2 .. 22^2, then 512 instead of 23^2. 23 levels, 4307 grid cells.
+  levels: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324, 361, 400, 441, 484, 512]
+  learned_l1_sampling: true
+  learned_l1_cascade: true
+  learned_l1_cascade_base: 4
+  quant_resi:
+    enabled: true
+    ratio: 0.5
+
+generator:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  bias: true
+  dropout: 0.0
+  prefix_len: 32
+  prefix_source: window
+  rope_base: 100000
+  use_rope: true
+  use_level_encoding: true
+  use_qk_norm: true
+  attn_pattern: block_diagonal
+  predict_level0: false
+
+dialogue:
+  enabled: true
+  history_placement: both
+  truncation: keep_tail
+  pad_side: right
+  user_marker: User
+  assistant_marker: Assistant
+  system_marker: System
+  add_special_role_tokens: false
+
+data:
+  dataset: "unset"
+  hidden_pct: 1
+  visible_pct: 1
+  max_windows: 0
+
+eval:
+  batch_size: 1
+  max_windows: 2
+  n_generate: 0
+  device: auto

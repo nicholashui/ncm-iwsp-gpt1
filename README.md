@@ -102,7 +102,7 @@ python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
 
 ## 文字對話
 
-`python -m ncm_iwsp_gpt1 chat` 把短提示接成一個 window 的延續。它不是 causal LM，也不是聊天機器人，也不是 NCM-GPT1。`predict_level0` 維持 false，level 0 不是 generator 的目標。預設 config 是 phase 1：`prefix_len` 維持 1，那個位置仍是 `<|endoftext|>`，用來對上現有權重。提示詞不放進這個前綴。Phase 2 是另一份 config，`configs/target_phase2.yaml`（`prefix_len` 32，`prefix_source: window`），提示詞放進前綴。這份程式不啟動訓練。
+`python -m ncm_iwsp_gpt1 chat` 把短提示接成一個 window 的延續。它不是 causal LM，也不是聊天機器人，也不是 NCM-GPT1。`predict_level0` 維持 false，level 0 不是 generator 的目標。預設 config 是 phase 1：`prefix_len` 維持 1，那個位置仍是 `<|endoftext|>`，用來對上現有權重。提示詞不放進這個前綴。Phase 2 是另一份 config，`configs/target_phase2.yaml`（`prefix_len` 32，`prefix_source: window`），提示詞放進前綴。Phase 3 是 `configs/target_phase3.yaml` 加上 `pack-dialogue` / `finetune-dialogue`，預設不啟用；沒有選定對話語料。沒有 `--dialogue` 和對話檢查點時，`chat` 不會自稱聊天機器人。這份程式不啟動訓練。
 
 預設要一個前綴 level-0 頭（`--prefix-head`）。頭讀真實提示的 `encoder.wte`，抽出一個 level-0，不再把短句重複填滿 context。細碼仍由凍結的 generator 抽出再解碼。stderr 印 `level0_source=prefix_head`。沒有這個 checkpoint 就停下來，不會退回重複打包。對照組要寫明：`--level0-source packed`，或 `--level0-source unigram --packed packed_windows.pt`。
 
@@ -125,6 +125,8 @@ cd /d e:\Project\ncm-iwsp-gpt1
 ```
 
 `--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The default config keeps the generator prefix as `<|endoftext|>`. Phase 2 is `--config configs/target_phase2.yaml`: `prefix_len` 32, and the prompt is placed in that prefix (right-pad with pad id 50257). The small CPU file is `configs/gpt1_data_phase2.yaml` (`prefix_len` 8). See [`docs/chat.md`](docs/chat.md). This change does not start training. The v3 generator is not in git. The prefix head, its metrics, and the val-CE plot are in [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/).
+
+Phase 3 is opt-in and does not select a corpus. `pack-dialogue` needs `--dataset-id`, an allow-list that contains that id, and `--license-note`. `configs/dialogue_allowlist.txt` ships with no ids. Banned names still go through the book packer's refusal. `finetune-dialogue` warm-starts from a phase-2 generator checkpoint, writes only to a new `--out`, requires `--confirm`, freezes the tokenizer, keeps `predict_level0` false, and does not retrain the prefix head. History placement is `prefix`, `window`, or `both` (`both` in the phase-3 yaml). Overflow drops the oldest tokens. `chat --dialogue` keeps history and prints a slice of the decoded window (512 tokens on the target config) only when the checkpoint format is `ncm-iwsp-gpt1-dialogue`. `ce_first` / `ce_mid` / `ce_last` stay the comparable code means. They are not a chatbot score. Details are in [`docs/chat.md`](docs/chat.md).
 
 ## 安裝
 

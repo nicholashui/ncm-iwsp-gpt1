@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 
+from ncm_iwsp_gpt1.dialogue import normalize_history_placement
 from ncm_iwsp_gpt1.levels import square_levels
 from ncm_iwsp_gpt1.prefix_protocol import normalize_prefix_source
 
@@ -86,3 +87,38 @@ def _validate(cfg: dict, path: Path) -> None:
     visible = int(cfg["data"]["visible_pct"])
     if hidden < 0 or visible < 0 or hidden + visible >= 100:
         raise ValueError("hidden_pct and visible_pct must be non-negative and sum to < 100")
+    _validate_dialogue(cfg)
+
+
+def _validate_dialogue(cfg: dict) -> None:
+    """Phase 3 block. Absent on phase 1 and phase 2 configs."""
+    if "dialogue" not in cfg or cfg["dialogue"] is None:
+        return
+    dialogue = cfg["dialogue"]
+    if not isinstance(dialogue, dict):
+        raise ValueError("dialogue must be a mapping")
+    if "add_special_role_tokens" in dialogue and dialogue["add_special_role_tokens"] is not False:
+        raise ValueError(
+            "dialogue.add_special_role_tokens must stay false. "
+            "Phase 3 does not add user/assistant ids or expand GPT-2 BPE or encoder.wte."
+        )
+    try:
+        normalize_history_placement(dialogue.get("history_placement"))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    truncation = str(dialogue.get("truncation", "keep_tail")).strip().lower()
+    if truncation != "keep_tail":
+        raise ValueError(
+            "dialogue.truncation must be keep_tail (drop the oldest tokens from the left)"
+        )
+    pad_side = str(dialogue.get("pad_side", "right")).strip().lower()
+    if pad_side != "right":
+        raise ValueError("dialogue.pad_side must be right")
+    for key, default in (
+        ("user_marker", "User"),
+        ("assistant_marker", "Assistant"),
+        ("system_marker", "System"),
+    ):
+        marker = str(dialogue.get(key, default)).strip()
+        if not marker or marker.startswith("<") or "<|" in marker:
+            raise ValueError(f"dialogue.{key} must be a plain-text role marker, not a special token")

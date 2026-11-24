@@ -2,7 +2,7 @@
 
 `python -m ncm_iwsp_gpt1 chat` continues a short prompt as one decoded window. It is not a causal language model, not NCM-GPT1, and not a chatbot. A prompt such as `How are you?` is not expected to come back as `I'm fine`. Code cross-entropy and 2018 GPT-1 perplexity are not the quality check for this path.
 
-`predict_level0` stays false. Level 0 is not a target of `NextConceptGenerator`. The phase-1 configs `configs/target.yaml` and `configs/gpt1_data.yaml` keep `prefix_len` at 1. That one slot is `<|endoftext|>` (id 50256), the prefix the existing weights were trained with. The words of the prompt do not go there. Phase 2 is a separate config, described below. The default `--config` is still `configs/target.yaml`.
+`predict_level0` stays false. Level 0 is not a target of `NextConceptGenerator`. The phase-1 configs `configs/target.yaml` and `configs/gpt1_data.yaml` keep `prefix_len` at 1. That one slot is `<|endoftext|>` (id 50256), the prefix the existing weights were trained with. The words of the prompt do not go there. Phase 2 is a separate config, described below. Phase 3 is also separate and stays off unless its commands and flags are passed. No dialogue corpus is selected. The default `--config` is still `configs/target.yaml`.
 
 ## What one turn does
 
@@ -179,3 +179,104 @@ python -m ncm_iwsp_gpt1 chat \
 ```
 
 The four prompts the plan names are `How are you?`, `Hello world`, `The cat sat`, and `下一概念`. Readable continuation of those prompts is a later check on a fine-tuned checkpoint. It is not a result of this source change, and it is not a chatbot answer.
+
+## Phase 3
+
+Phase 3 is dialogue source on top of the phase-2 prefix. It does not start training, does not submit a Kaggle job, and does not turn `predict_level0` on. Phase 1 and phase 2 configs and commands are unchanged when the phase-3 flags are absent. `chat` still does not call itself a chatbot unless `--dialogue` is set and `--finetune` is a dialogue checkpoint (`format` `ncm-iwsp-gpt1-dialogue`). A missing prefix head still exits. It does not fall back to packed-encode.
+
+No dialogue or instruction corpus is selected. `data.dataset` on the phase-3 yaml is `unset` on purpose. The id is required on the command line at pack time and again at train time. Chinese pretraining and Chinese dialogue corpora are not selected. MiniMind SFT, DPO, and RLAIF names stay refused. The BookCorpus Open `pack` path is unchanged.
+
+| Config | What it is |
+| --- | --- |
+| `configs/target.yaml` | Phase 1. `prefix_len` 1, end-of-text prefix. Default chat config. |
+| `configs/gpt1_data.yaml` | Phase 1, small. |
+| `configs/target_phase2.yaml` | Phase 2. `prefix_len` 32, `prefix_source: window`. |
+| `configs/gpt1_data_phase2.yaml` | Phase 2, small. `prefix_len` 8. |
+| `configs/target_phase3.yaml` | Phase 3 target. Same 12/768 body, `prefix_len` 32, `history_placement: both`. |
+| `configs/gpt1_data_phase3.yaml` | Phase 3, small. `prefix_len` 8, same placement. |
+| `configs/dialogue_allowlist.txt` | Ships with no dataset ids. |
+
+`prefix_len` 32 matches phase 2 so a phase-2 generator checkpoint can warm-start. 64 is still a one-line edit of `prefix_len` in `configs/target_phase3.yaml`. The mask and RoPE buffers follow that length. The transformer weights do not change shape.
+
+### Packing
+
+`pack-dialogue` is a separate command. It does not go through `make_cache`, and it does not skip `packing._refuse_corpus_name`. A local file name, the dataset id, and every allow-list line are checked against the same banned fragments. An allow-list hit does not authorize a banned name.
+
+The command requires all of:
+
+- `--dataset-id` (there is no default)
+- `--allow-list` pointing at a file that lists that exact id
+- `--license-note` (this repository does not supply one)
+- one source: `--jsonl`, `--arrow`, `--hf-cache`, or `--hf-dataset` plus `--download`
+
+`lucadiliello/bookcorpusopen` stays on `pack`. A text-only row is rejected here. Accepted rows are `messages` or `conversations` lists of role and content, or one prompt/response pair. Role aliases such as `human` and `gpt` are field names, not a chosen corpus. Each assistant reply after a user turn becomes one window. Rows are not concatenated the way BookCorpus paragraphs are. The cache stays out of git.
+
+Role markers are the plain strings `User`, `Assistant`, and `System`. They are not new token ids. `dialogue.add_special_role_tokens` must stay false. GPT-2 BPE and `encoder.wte` are not expanded.
+
+### History
+
+`dialogue.history_placement` is `prefix`, `window`, or `both`. The phase-3 files set `both`. That is a switch, not a tuned recipe.
+
+Truncation is `keep_tail`. Turns are oldest-first. Tokens that do not fit are dropped from the left, so the newest turn stays. A short sequence is right-padded with pad id 50257. This is not the phase-2 prompt rule, which keeps the first `prefix_len` tokens.
+
+- `prefix`: the generator prefix is the tail of the conditioning turns. The training window is the assistant reply only.
+- `window`: the training window is the whole dialogue, left-truncated. The generator prefix is the first `prefix_len` tokens of that window. At inference the reply does not exist yet, so this prefix is only the start of the truncated history and can differ from training.
+- `both`: the window is the whole dialogue, and the prefix is the conditioning tail, so train and inference prefixes match. Some history tokens can appear in both places.
+
+Phase 2 `prefix_len` is 32 on the 12/768 config (8 on the small file). A long history will not fit in the prefix. `keep_tail` is how that overflow is cut.
+
+### Fine-tune
+
+`finetune-dialogue` warm-starts the generator from `--generator` (a phase-2 `latest.pt` or a converted `generator.pt`) and writes only to a new `--out`. `--confirm` is required. The tokenizer stays frozen. `predict_level0` stays false. The prefix head is not retrained. `--retrain-prefix-head` is an error, not a silent second loop. `--dataset-id` must match the cache. The book-window `finetune` command refuses a phase-3 config and refuses a dialogue cache.
+
+Learning rate, steps, batch size, corruption, and validation frequency are the existing finetune CLI defaults. They are not an approved phase-3 recipe. `finetune-dialogue --dry-plan` prints that and does not train.
+
+`ce_first`, `ce_mid`, and `ce_last` stay raw per-level means. Compare them when `alpha` and `mid_aux` match. Do not compare the optimized total loss across different `alpha` or `mid_aux`. Do not read code cross-entropy as chatbot quality. The checkpoint records `code_ce_is_chat_quality: false`.
+
+```bash
+python -m ncm_iwsp_gpt1 pack-dialogue \
+  --config configs/target_phase3.yaml \
+  --dataset-id <id-on-your-allow-list> \
+  --allow-list /path/to/allow-list.txt \
+  --license-note "<license or authorization>" \
+  --jsonl /path/to/local.jsonl \
+  --out /path/to/dialogue_windows.pt
+
+python -m ncm_iwsp_gpt1 finetune-dialogue \
+  --config configs/target_phase3.yaml \
+  --dry-plan
+
+python -m ncm_iwsp_gpt1 finetune-dialogue \
+  --config configs/gpt1_data_phase3.yaml \
+  --tokenizer /path/to/tokenizer.pt \
+  --generator /path/to/phase2-latest.pt \
+  --packed /path/to/dialogue_windows.pt \
+  --dataset-id <same-id> \
+  --out /path/to/new-dialogue-out \
+  --confirm \
+  --max-steps 1
+```
+
+### Reply slice
+
+Generation still decodes one whole window. It does not stop at a token. With `--dialogue` and a dialogue checkpoint, stdout prints a slice. `decoded_window` remains the model text. Score that, not the slice.
+
+1. If the decoded window starts with the rendered history, including the current user line, that leading copy is removed. Overlap is only a prefix strip.
+2. Otherwise, if it starts with the current `User:` line, that line is removed.
+3. A leading `Assistant:` marker is removed.
+4. The reply ends before the next line that starts with `User:`.
+5. `--max-reply-tokens` 0 leaves that remainder. A positive value keeps the first that many BPE tokens.
+
+Session history stores the user line and that sliced reply, not the rest of the window. The next turn can place that history in the prefix, the window, or both. `/clear` drops it. Without `--dialogue`, history is not stored, including on `configs/target_phase3.yaml`.
+
+```bash
+python -m ncm_iwsp_gpt1 chat \
+  --config configs/target_phase3.yaml \
+  --dialogue \
+  --tokenizer /path/to/tokenizer.pt \
+  --finetune /path/to/new-dialogue-out/latest.pt \
+  --prefix-head artifacts/kaggle-prefix-level0-v2/prefix_level0.pt \
+  --prompt "How are you?"
+```
+
+The phase-1 prefix head was not trained on dialogue and is not retrained here. A readable answer is not a result of this source change. Passing conditions for phase 3 are still unset. Code CE, a 2018 GPT-1 perplexity, and "the window looks like English" are not those conditions.

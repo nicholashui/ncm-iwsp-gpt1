@@ -21,7 +21,13 @@ from ncm_iwsp_gpt1.prefix_level0 import PrefixLevel0Error, describe_prefix_run, 
 from ncm_iwsp_gpt1.config import load_config
 from ncm_iwsp_gpt1.convert import FORMAT_NAME, ConvertError, convert_files, load_converted_checkpoint
 from ncm_iwsp_gpt1.evaluate import evaluate_windows
-from ncm_iwsp_gpt1.finetune import FinetuneError, describe_run, run_finetune
+from ncm_iwsp_gpt1.finetune import (
+    FinetuneError,
+    describe_dialogue_run,
+    describe_run,
+    run_dialogue_finetune,
+    run_finetune,
+)
 from ncm_iwsp_gpt1.loop import load_writer, run_dry_loop
 from ncm_iwsp_gpt1.packing import (
     demo_texts,
@@ -249,6 +255,8 @@ def _cmd_chat(args) -> int:
             level0_source=args.level0_source,
             packed_path=args.packed,
             unigram_max_windows=args.unigram_max_windows,
+            dialogue=bool(args.dialogue),
+            max_reply_tokens=int(args.max_reply_tokens),
         )
     except (ChatError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -268,7 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
             "finetune is a separate gradient run of the untied generator. "
             "chat continues one window from a prefix level-0 head. "
             "The default config keeps a one-token end-of-text prefix. "
-            "configs/target_phase2.yaml places the prompt in a longer prefix."
+            "configs/target_phase2.yaml places the prompt in a longer prefix. "
+            "Phase 3 is pack-dialogue and finetune-dialogue on configs/target_phase3.yaml. "
+            "No dialogue corpus is selected."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -400,6 +410,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help="how many packed rows to count for the unigram baseline",
     )
+    chat.add_argument(
+        "--dialogue",
+        action="store_true",
+        help=(
+            "phase 3 only: keep session history and slice a reply from the decoded window. "
+            "Requires a phase-3 config and a dialogue checkpoint (--finetune format "
+            "ncm-iwsp-gpt1-dialogue). Without that checkpoint, chat stops and does not "
+            "call itself a chatbot."
+        ),
+    )
+    chat.add_argument(
+        "--max-reply-tokens",
+        type=int,
+        default=0,
+        help="phase 3 reply cap after slicing; 0 keeps the remainder of the window",
+    )
     chat.set_defaults(func=_cmd_chat)
 
     train_prefix = sub.add_parser(
@@ -480,11 +506,101 @@ def build_parser() -> argparse.ArgumentParser:
     finetune.add_argument("--no-checkpointing", action="store_true")
     finetune.add_argument("--no-chunked-attn", action="store_true")
     finetune.set_defaults(func=_cmd_finetune)
+
+    pack_dialogue = sub.add_parser(
+        "pack-dialogue",
+        help="pack an explicitly authorized dialogue or instruction file",
+        description=(
+            "Pack dialogue rows into one window per assistant reply. "
+            "This is not the BookCorpus pack command. "
+            "No dataset is selected: pass --dataset-id, an allow-list that contains that id, "
+            "and --license-note. Banned names (MiniMind, SFT, DPO, RLAIF, adapters) are still refused. "
+            "The output is not committed. This command does not train."
+        ),
+    )
+    pack_dialogue.add_argument("--config", required=True)
+    pack_dialogue.add_argument("--dataset-id", required=True, help="operator-supplied id; not a default corpus")
+    pack_dialogue.add_argument("--allow-list", required=True, help="text file of allowed dataset ids, one per line")
+    pack_dialogue.add_argument("--license-note", required=True, help="license or authorization for this dataset")
+    pack_dialogue.add_argument("--jsonl", default=None, help="local JSONL of dialogue rows. Not committed.")
+    pack_dialogue.add_argument("--arrow", default=None, help="local .arrow or .parquet dialogue file. Not committed.")
+    pack_dialogue.add_argument("--hf-cache", default=None, help="local HF dataset directory")
+    pack_dialogue.add_argument("--hf-dataset", default=None, help="dataset id, used only with --download; must equal --dataset-id")
+    pack_dialogue.add_argument("--hf-split", default="train")
+    pack_dialogue.add_argument("--download", action="store_true", help="allow a network fetch; off by default")
+    pack_dialogue.add_argument("--max-docs", type=int, default=0, help="stop after this many rows (0 = no cap)")
+    pack_dialogue.add_argument("--max-windows", type=int, default=None, help="override data.max_windows")
+    pack_dialogue.add_argument("--out", required=True)
+    pack_dialogue.set_defaults(func=_cmd_pack_dialogue)
+
+    finetune_dialogue = sub.add_parser(
+        "finetune-dialogue",
+        help="fine-tune the generator on a pack-dialogue cache; the prefix head stays frozen",
+        description=(
+            "Warm-start the generator, usually from a phase-2 checkpoint, and train on a "
+            "pack-dialogue cache. The tokenizer stays frozen. predict_level0 stays false. "
+            "The prefix head is not retrained. --dataset-id is required and must match the cache. "
+            "Hyperparameters are the existing finetune defaults, not an approved phase-3 recipe. "
+            "--confirm is required. Writes only to --out. This command does not submit a Kaggle job."
+        ),
+    )
+    finetune_dialogue.add_argument("--config", default="configs/target_phase3.yaml")
+    finetune_dialogue.add_argument("--tokenizer", default=None, help="frozen tokenizer.pt (read-only)")
+    finetune_dialogue.add_argument(
+        "--generator",
+        default=None,
+        help="phase-2 latest.pt or converted generator.pt to warm-start (read-only)",
+    )
+    finetune_dialogue.add_argument("--packed", default=None, help="pack-dialogue cache; not committed")
+    finetune_dialogue.add_argument("--dataset-id", default=None, help="must match the cache; no default corpus")
+    finetune_dialogue.add_argument("--out", default=None, help="new directory for checkpoints and logs")
+    finetune_dialogue.add_argument("--dry-plan", action="store_true", help="print the run plan and exit without building")
+    finetune_dialogue.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required to train. Does not submit a Kaggle job.",
+    )
+    finetune_dialogue.add_argument(
+        "--retrain-prefix-head",
+        action="store_true",
+        help="refused. The prefix head is not retrained by this command.",
+    )
+    finetune_dialogue.add_argument("--max-steps", type=int, default=100_000)
+    finetune_dialogue.add_argument("--batch-size", type=int, default=1, help="per GPU. Default 1 is the existing finetune default.")
+    finetune_dialogue.add_argument("--grad-accum", type=int, default=1)
+    finetune_dialogue.add_argument("--peak-lr", type=float, default=3e-5)
+    finetune_dialogue.add_argument("--floor-lr", type=float, default=3e-6)
+    finetune_dialogue.add_argument("--warmup", type=int, default=100)
+    finetune_dialogue.add_argument("--weight-decay", type=float, default=0.1)
+    finetune_dialogue.add_argument("--grad-clip", type=float, default=1.0)
+    finetune_dialogue.add_argument("--alpha", type=float, default=0.0)
+    finetune_dialogue.add_argument("--mid-aux", type=float, default=0.0)
+    finetune_dialogue.add_argument("--corrupt-p-max", type=float, default=0.8)
+    finetune_dialogue.add_argument("--corrupt-p-min", type=float, default=0.2)
+    finetune_dialogue.add_argument("--val-every", type=int, default=1000)
+    finetune_dialogue.add_argument("--val-windows", type=int, default=256)
+    finetune_dialogue.add_argument("--val-batch-size", type=int, default=1)
+    finetune_dialogue.add_argument("--save-every", type=int, default=1000)
+    finetune_dialogue.add_argument("--log-every", type=int, default=50)
+    finetune_dialogue.add_argument("--max-hours", type=float, default=None)
+    finetune_dialogue.add_argument("--reserve-minutes", type=float, default=15.0)
+    finetune_dialogue.add_argument("--resume", default="auto", help="auto, none, or a dialogue checkpoint path")
+    finetune_dialogue.add_argument("--device", default="auto", help="auto, cuda, or cpu")
+    finetune_dialogue.add_argument("--workers", type=int, default=0)
+    finetune_dialogue.add_argument("--seed", type=int, default=None)
+    finetune_dialogue.add_argument("--no-checkpointing", action="store_true")
+    finetune_dialogue.add_argument("--no-chunked-attn", action="store_true")
+    finetune_dialogue.set_defaults(func=_cmd_finetune_dialogue)
     return parser
 
 
 def _cmd_finetune(args) -> int:
     cfg = load_config(args.config)
+    if isinstance(cfg.get("dialogue"), dict) and cfg["dialogue"].get("enabled"):
+        raise SystemExit(
+            "this config enables dialogue. Use finetune-dialogue. "
+            "The finetune command stays the book-window path."
+        )
     options = {
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,
@@ -519,6 +635,199 @@ def _cmd_finetune(args) -> int:
             args.generator,
             args.packed,
             args.out,
+            batch_size=args.batch_size,
+            grad_accum=args.grad_accum,
+            peak_lr=args.peak_lr,
+            floor_lr=args.floor_lr,
+            warmup=args.warmup,
+            max_steps=args.max_steps,
+            weight_decay=args.weight_decay,
+            grad_clip=args.grad_clip,
+            alpha=args.alpha,
+            mid_aux=args.mid_aux,
+            corrupt_p_max=args.corrupt_p_max,
+            corrupt_p_min=args.corrupt_p_min,
+            val_every=args.val_every,
+            val_windows=args.val_windows,
+            val_batch_size=args.val_batch_size,
+            save_every=args.save_every,
+            log_every=args.log_every,
+            max_hours=args.max_hours,
+            reserve_minutes=args.reserve_minutes,
+            resume=args.resume,
+            device=args.device,
+            gradient_checkpointing=not args.no_checkpointing,
+            chunked_block_attn=not args.no_chunked_attn,
+            workers=args.workers,
+            seed=args.seed,
+        )
+    except FinetuneError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _take_records(iterator, max_docs: int) -> list:
+    rows = []
+    cap = int(max_docs or 0)
+    for row in iterator:
+        rows.append(row)
+        if cap and len(rows) >= cap:
+            break
+    if not rows:
+        raise SystemExit("no dialogue rows found")
+    return rows
+
+
+def _iter_hf_rows(name: str, split: str):
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise SystemExit(
+            "pip install datasets  # only required for --download"
+        ) from exc
+    dataset = load_dataset(name, split=split, streaming=True)
+    for row in dataset:
+        if isinstance(row, dict):
+            yield row
+
+
+def _cmd_pack_dialogue(args) -> int:
+    from ncm_iwsp_gpt1.dialogue import (
+        DialogueError,
+        dialogue_settings,
+        iter_dialogue_jsonl,
+        iter_dialogue_tables,
+        pack_dialogue_records,
+        require_dataset_authorization,
+    )
+
+    cfg = load_config(args.config)
+    try:
+        settings = dialogue_settings(cfg)
+        dataset_id = require_dataset_authorization(
+            args.dataset_id, args.allow_list, args.license_note
+        )
+    except DialogueError as exc:
+        raise SystemExit(str(exc)) from exc
+    sources = [args.jsonl, args.arrow, args.hf_cache, args.hf_dataset]
+    if sum(item is not None for item in sources) != 1:
+        raise SystemExit(
+            "pack-dialogue needs exactly one of --jsonl, --arrow, --hf-cache, --hf-dataset. "
+            "There is no demo corpus and no default dataset."
+        )
+    if args.hf_dataset and not args.download:
+        raise SystemExit(
+            "download is off by default. Pass --download to fetch the dataset, "
+            "or pack a local --jsonl, --arrow, or --hf-cache."
+        )
+    if args.hf_dataset and str(args.hf_dataset).strip() != dataset_id:
+        raise SystemExit(
+            "--hf-dataset must equal --dataset-id. The id is not rewritten to another corpus."
+        )
+    try:
+        if args.jsonl:
+            records = _take_records(iter_dialogue_jsonl(args.jsonl), args.max_docs)
+            source = args.jsonl
+        elif args.arrow:
+            records = _take_records(iter_dialogue_tables(args.arrow), args.max_docs)
+            source = args.arrow
+        elif args.hf_cache:
+            records = _take_records(iter_dialogue_tables(args.hf_cache), args.max_docs)
+            source = args.hf_cache
+        else:
+            try:
+                refuse_source = str(args.hf_dataset)
+                from ncm_iwsp_gpt1.packing import refuse_banned_label
+
+                refuse_banned_label(refuse_source)
+            except ValueError as exc:
+                raise DialogueError(str(exc)) from exc
+            records = _take_records(_iter_hf_rows(args.hf_dataset, args.hf_split), args.max_docs)
+            source = args.hf_dataset
+        pretok = GPT2BPE.from_config(cfg)
+        data = cfg.get("data", {})
+        max_windows = (
+            int(args.max_windows) if args.max_windows is not None else int(data.get("max_windows", 0) or 0)
+        )
+        cache = pack_dialogue_records(
+            records,
+            pretok,
+            context_length=settings["context_length"],
+            prefix_len=settings["prefix_len"],
+            placement=settings["history_placement"],
+            dataset_id=dataset_id,
+            license_note=args.license_note,
+            source=source,
+            user_marker=settings["user_marker"],
+            assistant_marker=settings["assistant_marker"],
+            system_marker=settings["system_marker"],
+            hidden_pct=int(data.get("hidden_pct", 10)),
+            visible_pct=int(data.get("visible_pct", 10)),
+            max_windows=max_windows,
+        )
+    except (DialogueError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    save_cache(cache, args.out)
+    print(json.dumps(cache["meta"], indent=2, ensure_ascii=False))
+    print(f"wrote {args.out}")
+    return 0
+
+
+def _finetune_options(args) -> dict:
+    return {
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "peak_lr": args.peak_lr,
+        "floor_lr": args.floor_lr,
+        "warmup": args.warmup,
+        "max_steps": args.max_steps,
+        "weight_decay": args.weight_decay,
+        "alpha": args.alpha,
+        "mid_aux": args.mid_aux,
+        "corrupt_p_max": args.corrupt_p_max,
+        "corrupt_p_min": args.corrupt_p_min,
+        "val_windows": args.val_windows,
+        "gradient_checkpointing": not args.no_checkpointing,
+        "chunked_block_attn": not args.no_chunked_attn,
+    }
+
+
+def _cmd_finetune_dialogue(args) -> int:
+    cfg = load_config(args.config)
+    if args.retrain_prefix_head:
+        raise SystemExit(
+            "the prefix head is not retrained. "
+            "--retrain-prefix-head is an error, not a silent retrain."
+        )
+    options = _finetune_options(args)
+    if args.dry_plan:
+        try:
+            print(json.dumps(describe_dialogue_run(cfg, options), indent=2))
+        except FinetuneError as exc:
+            raise SystemExit(str(exc)) from exc
+        return 0
+    if not args.confirm:
+        raise SystemExit(
+            "Pass --confirm after reviewing the input paths. "
+            "finetune-dialogue trains the generator on a dialogue cache and does not submit a Kaggle job. "
+            "No dialogue corpus is selected unless you pass --dataset-id."
+        )
+    if not args.dataset_id:
+        raise SystemExit(
+            "finetune-dialogue needs --dataset-id. No dialogue corpus is selected in this repository."
+        )
+    if not args.tokenizer or not args.generator or not args.packed or not args.out:
+        raise SystemExit("finetune-dialogue needs --tokenizer, --generator, --packed, --dataset-id, and --out")
+    try:
+        summary = run_dialogue_finetune(
+            cfg,
+            args.tokenizer,
+            args.generator,
+            args.packed,
+            args.out,
+            dataset_id=args.dataset_id,
+            retrain_prefix_head=False,
             batch_size=args.batch_size,
             grad_accum=args.grad_accum,
             peak_lr=args.peak_lr,

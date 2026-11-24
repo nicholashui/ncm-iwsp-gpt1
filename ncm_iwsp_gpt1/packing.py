@@ -10,6 +10,10 @@ a short paragraph does not become its own full-context row.
 The cache is a torch dict in the spirit of NCM-GPT1's ``packed_windows.pt``:
 ``visible_train``, ``visible``, ``hidden``, and ``meta``. The corpus itself
 is never written here. Download is not performed by this module.
+
+Dialogue packing is not this function. ``pack-dialogue`` is a separate
+command. It still calls ``_refuse_corpus_name`` and does not skip the banned
+names below. ``make_cache`` stays the BookCorpus Open path.
 """
 
 from __future__ import annotations
@@ -99,13 +103,30 @@ def split_paragraphs(text: str) -> list[str]:
     return [text]
 
 
-def _refuse_corpus_name(path: Path) -> None:
-    name = path.name.lower()
-    if name in _BANNED_NAMES or any(bit in name for bit in _BANNED_BITS):
+def refuse_banned_label(label: str) -> None:
+    """Refuse MiniMind, SFT, DPO, RLAIF, and adapter names.
+
+    ``_refuse_corpus_name`` calls this. Dialogue packing calls it too, on the
+    file name and on the operator-supplied dataset id. A banned label is not
+    accepted by putting it on an allow-list.
+    """
+    text = str(label).strip().lower().replace("\\", "/")
+    if not text:
+        return
+    base = text.split("/")[-1]
+    if base in _BANNED_NAMES or text in _BANNED_NAMES or any(bit in text for bit in _BANNED_BITS):
+        shown = Path(str(label)).name or str(label)
         raise ValueError(
-            f"refusing {path.name}: NCM-iWSP-GPT1 packs lucadiliello/bookcorpusopen, "
+            f"refusing {shown}: NCM-iWSP-GPT1 packs lucadiliello/bookcorpusopen, "
             "not MiniMind pretrain, SFT, DPO, RLAIF, or adapter data"
         )
+
+
+def _refuse_corpus_name(path: Path) -> None:
+    refuse_banned_label(Path(path).name)
+    # A parent directory can carry a banned fragment even when the file name
+    # itself does not. Check the whole path string as well.
+    refuse_banned_label(str(path))
 
 
 def iter_jsonl_texts(path: str | Path):
