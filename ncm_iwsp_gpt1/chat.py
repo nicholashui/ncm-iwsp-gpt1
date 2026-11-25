@@ -129,7 +129,10 @@ Layouts loaded as-is:
   --tokenizer tokenizer.pt --finetune latest.pt
       latest.pt format ncm-iwsp-gpt1-finetune; the model state dict is the
       generator and the optimizer is ignored
-Train the head with `python -m ncm_iwsp_gpt1 train-prefix-level0`.
+Train the phase-1 head with `python -m ncm_iwsp_gpt1 train-prefix-level0`.
+A dialogue prefix head is a different command,
+`python -m ncm_iwsp_gpt1 train-prefix-level0-dialogue`.
+finetune-dialogue does not train this head.
 """
 
 

@@ -156,7 +156,7 @@ The plan allowed `prefix_len` 32 or 64. **32** is the shipped 12/768 value. It i
 - stdout may print the original prompt in front of the decoded window when the window does not already start with that prompt. `text` and `decoded_window` are the model's window. Score those, not the spliced display.
 - `--level0-source packed` and `unigram` stay explicit baselines. On a phase-2 config their generator prefix is also the prompt. The unigram-plus-end-of-text control is the phase-1 config, not a second hidden prefix inside phase 2. Eval still emits an end-of-text unigram sample and labels it as that control.
 
-The prefix head is **not** retrained. `train-prefix-level0` still refuses `prefix_len != 1`. Chat on the phase-2 config uses the existing head: it reads `encoder.wte` and does not depend on generator `prefix_len`. Retraining the head would be a later change with its own trigger. This path does not add a dialogue loader. The packer still rejects MiniMind SFT, DPO, and RLAIF filenames.
+The prefix head is **not** retrained by phase-2 `finetune`. `train-prefix-level0` still refuses `prefix_len != 1`. Chat on the phase-2 config uses the existing head: it reads `encoder.wte` and does not depend on generator `prefix_len`. Dialogue head training is the separate command `train-prefix-level0-dialogue`, under Phase 3 below. This phase-2 path does not add a dialogue loader. The packer still rejects MiniMind SFT, DPO, and RLAIF filenames.
 
 Fine-tune, when someone runs it later, is the existing `finetune` command pointed at `configs/target_phase2.yaml`. The tokenizer stays frozen. The generator warm-starts from a v3 `latest.pt`: persistent `transformer` and `lm_heads` load, and stale mask or RoPE buffers are ignored because those buffers are rebuilt for the new `prefix_len`. The checkpoint format string stays `ncm-iwsp-gpt1-finetune`. New checkpoints record `prefix_len` and `prefix_source`.
 
@@ -232,6 +232,38 @@ Phase 2 `prefix_len` is 32 on the 12/768 config (8 on the small file). A long hi
 Learning rate, steps, batch size, corruption, and validation frequency are the existing finetune CLI defaults. They are not an approved phase-3 recipe. `finetune-dialogue --dry-plan` prints that and does not train.
 
 `ce_first`, `ce_mid`, and `ce_last` stay raw per-level means. Compare them when `alpha` and `mid_aux` match. Do not compare the optimized total loss across different `alpha` or `mid_aux`. Do not read code cross-entropy as chatbot quality. The checkpoint records `code_ce_is_chat_quality: false`.
+
+### Dialogue prefix head
+
+`finetune-dialogue` still does not retrain the prefix head. The prefix head is not retrained by that command. `--retrain-prefix-head` is an error, not a second loop. `train-prefix-level0` still refuses a phase-3 config and still refuses a dialogue pack.
+
+`train-prefix-level0-dialogue` is the head-only command. It keeps `predict_level0` false. The tokenizer stays frozen. The generator checkpoint is loaded and frozen so `prefix_len` and `prefix_source` can be checked; those weights are not updated. The level-0 target is still the code of the full packed window. The head input is the pack's prefix row with pad id 50257 removed, not the first tokens of the window. T is drawn from 1 through that unpadded length, so a 7-token `User: How are you?` stays in distribution. `history_placement: window` is refused because that prefix can contain the assistant reply. `prefix` and `both` keep the reply out of the prefix. Past turns that are already in the conditioning stay.
+
+`--dataset-id` is required and must match the cache, which must already carry a license note. Banned names are refused. No corpus is selected by the config. `--dry-plan` prints the plan and does not train. A real run needs `--confirm` and `--max-steps`. The command writes only to `--out`. It does not default to `ncm-iwsp-gpt1-prefix-level0`, and that directory is refused. The intended NicNicNic directory is `E:\Project\ncm-iwsp-gpt1-prefix-level0-phase3`. Any other new directory is accepted. An existing phase-1 `prefix_level0.pt` can be passed as `--resume`; it is read-only and the new checkpoint is written under `--out`.
+
+Validation logs level-0 cross-entropy at T=1, T=4, T=7, T=32, and each row's full unpadded length, against an add-one unigram of the dialogue windows. That comparison is not a chatbot score. Aligning the head may still not yield coherent chat. Success of a later run is a readable Dolly-format continuation.
+
+```bash
+python -m ncm_iwsp_gpt1 train-prefix-level0-dialogue \
+  --config configs/target_phase3.yaml \
+  --dry-plan
+
+python -m ncm_iwsp_gpt1 train-prefix-level0-dialogue \
+  --config configs/target_phase3.yaml \
+  --tokenizer E:/Project/ncm-iwsp-gpt1-init/tokenizer.pt \
+  --generator E:/Project/ncm-iwsp-gpt1-finetune-phase3/latest.pt \
+  --packed E:/Project/ncm-iwsp-gpt1-dialogue-dolly-15k/packed_windows.pt \
+  --dataset-id databricks/databricks-dolly-15k \
+  --out E:/Project/ncm-iwsp-gpt1-prefix-level0-phase3 \
+  --resume E:/Project/ncm-iwsp-gpt1-prefix-level0/prefix_level0.pt \
+  --max-steps 20000 \
+  --batch-size 8 \
+  --lr 1e-3 \
+  --device cuda \
+  --confirm
+```
+
+`--max-steps 20000` is the previous head budget, not a new recipe. Do not start that run from this repository.
 
 ```bash
 python -m ncm_iwsp_gpt1 pack-dialogue \
