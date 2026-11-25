@@ -3,8 +3,10 @@
 The writer loop scores weights written in Python. ``ncm_iwsp_gpt1.finetune``
 is a separate gradient run of this architecture: untied heads, frozen
 tokenizer, no post-upsample convolution. ``ncm_iwsp_gpt1.prefix_level0``
-trains only a level-0 head on frozen tokenizer embeddings. It leaves
-``predict_level0`` false and ``prefix_len`` at 1. Phase 2 is a separate
+trains only a level-0 head on frozen tokenizer embeddings. The phase-1
+command leaves ``predict_level0`` false and ``prefix_len`` at 1.
+``train-prefix-level0-dialogue`` is a separate command for a phase-3
+dialogue pack and does not widen that guard. Phase 2 is a separate
 config (``configs/target_phase2.yaml``): a longer prefix filled with real
 tokens. Phase 3 (``configs/target_phase3.yaml``) is an opt-in dialogue pack
 and fine-tune. No dialogue corpus is selected. The default configs stay

@@ -11,6 +11,11 @@ is still ``<|endoftext|>``.
 Training draws T uniformly from 1 through the context length and asks the
 head to predict the level-0 code of the full packed window. Only this head
 is optimized. The tokenizer and the generator are frozen.
+
+``train-prefix-level0-dialogue`` is a separate command. It does not relax
+the phase-1 guard above. It reads a pack-dialogue cache, keeps the
+tokenizer and generator frozen, and pools the unpadded dialogue prefix
+(pad stripped) instead of the first T tokens of the full window.
 """
 
 from __future__ import annotations
@@ -25,10 +30,31 @@ import torch.nn.functional as F
 
 from ncm_iwsp_gpt1.build import build_models, lock_for_eval
 from ncm_iwsp_gpt1.device import resolve_device
-from ncm_iwsp_gpt1.finetune import FinetuneError, load_module_init, load_training_windows, refuse_finetune_output
+from ncm_iwsp_gpt1.dialogue import DialogueError, dialogue_settings
+from ncm_iwsp_gpt1.finetune import (
+    FinetuneError,
+    load_dialogue_windows,
+    load_module_init,
+    load_training_windows,
+    refuse_finetune_output,
+)
+from ncm_iwsp_gpt1.prefix_protocol import normalize_prefix_source, prefix_metadata_problems, recorded_prefix
 
 PREFIX_LEVEL0_FORMAT = "ncm-iwsp-gpt1-prefix-level0"
 POOLING = "attention_pool_of_wte_plus_learned_position"
+# Intended NicNicNic directory for this command. Not a default, and not the
+# only path the command will write. The phase-1 directory stays refused.
+RECOMMENDED_DIALOGUE_PREFIX_OUT = r"E:\Project\ncm-iwsp-gpt1-prefix-level0-phase3"
+PHASE1_PREFIX_DIR_NAME = "ncm-iwsp-gpt1-prefix-level0"
+DIALOGUE_PREFIX_NOTE = (
+    "Head-only training on unpadded dialogue prefixes from a pack-dialogue cache. "
+    "The tokenizer and the generator stay frozen. predict_level0 stays false. "
+    "Phase 1 train-prefix-level0 is unchanged and still requires prefix_len 1. "
+    "finetune-dialogue does not retrain this head; --retrain-prefix-head stays an error there. "
+    "Aligning the head may still not yield coherent chat. "
+    "Success of a later run is a readable Dolly-format continuation, not a chatbot score."
+)
+_DIALOGUE_VAL_LENGTHS = (1, 4, 7, 32)
 
 
 class PrefixLevel0Error(ValueError):
@@ -707,6 +733,613 @@ def run_prefix_level0(
             "val_windows": int(val.shape[0]),
         },
         "does_not_submit_kaggle": True,
+        **metrics,
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def _dialogue_prefix_config(cfg: dict) -> dict:
+    """Phase-3 guard for the dialogue prefix head. Phase 1 is not opened."""
+    generator = cfg["generator"]
+    tokenizer = cfg["tokenizer"]
+    if generator.get("predict_level0", False):
+        raise PrefixLevel0Error(
+            "predict_level0 must stay false. The prefix head is a separate module, "
+            "not a generator target."
+        )
+    if int(tokenizer["levels"][0]) != 1:
+        raise PrefixLevel0Error("the prefix head predicts a single level-0 code; levels[0] must be 1")
+    if isinstance(tokenizer["codebook_size"], (list, tuple)):
+        raise PrefixLevel0Error("codebook_size must be one integer")
+    if not isinstance(cfg.get("dialogue"), dict) or not cfg["dialogue"].get("enabled"):
+        raise PrefixLevel0Error(
+            "train-prefix-level0-dialogue needs a phase-3 config with dialogue.enabled true. "
+            "Phase 1 stays on train-prefix-level0, which still requires prefix_len 1. "
+            "Phase 2 stays on finetune."
+        )
+    source = normalize_prefix_source(generator.get("prefix_source", "eos"))
+    if source != "window":
+        raise PrefixLevel0Error(
+            "train-prefix-level0-dialogue needs generator.prefix_source window, "
+            "matching the phase-3 generator prefix."
+        )
+    if int(generator.get("prefix_len", 0)) < 1:
+        raise PrefixLevel0Error("train-prefix-level0-dialogue needs generator.prefix_len >= 1")
+    try:
+        settings = dialogue_settings(cfg)
+    except DialogueError as exc:
+        raise PrefixLevel0Error(str(exc)) from exc
+    if settings["history_placement"] == "window":
+        raise PrefixLevel0Error(
+            "history_placement window puts the assistant reply in the packed prefix. "
+            "train-prefix-level0-dialogue trains on conditioning tokens only "
+            "(history_placement prefix or both)."
+        )
+    return settings
+
+
+def describe_prefix_dialogue_run(cfg: dict, options: dict | None = None) -> dict:
+    """Plan a dialogue prefix-head run. Does not build modules or read a pack.
+
+    No dataset is selected here. ``--dataset-id`` is required only when training.
+    """
+    settings = _dialogue_prefix_config(cfg)
+    options = dict(options or {})
+    tokenizer = cfg["tokenizer"]
+    generator = cfg["generator"]
+    embed_dim = int(tokenizer["embed_dim"])
+    codebook_size = int(tokenizer["codebook_size"])
+    context_length = int(tokenizer["context_length"])
+    max_steps = options.get("max_steps")
+    return {
+        "system": "NCM-iWSP-GPT1",
+        "command": "train-prefix-level0-dialogue",
+        "config_name": cfg["name"],
+        "optimized": "prefix_level0_head",
+        "tokenizer_frozen": True,
+        "generator_frozen": True,
+        "predict_level0": False,
+        "prefix_len": int(generator["prefix_len"]),
+        "prefix_source": "window",
+        "history_placement": settings["history_placement"],
+        "context_length": context_length,
+        "embed_dim": embed_dim,
+        "codebook_size": codebook_size,
+        "level0_len": int(tokenizer["levels"][0]),
+        "head_parameters": head_parameter_count(embed_dim, codebook_size, context_length),
+        "pooling": POOLING,
+        "t_sampling": (
+            "uniform integer from 1 through the unpadded dialogue prefix length, one draw per row"
+        ),
+        "target": "level-0 code of the full packed window",
+        "features": (
+            "unpadded dialogue prefix rows, pad stripped; T is drawn from 1 through that length"
+        ),
+        "dataset": None,
+        "dataset_note": (
+            "No dialogue corpus is selected. --dataset-id is required to train and must match "
+            "the pack-dialogue cache. The cache must already carry a license note. "
+            "Banned names are refused. This command does not read BookCorpus windows."
+        ),
+        "batch_size": int(options.get("batch_size", 8)),
+        "lr": float(options.get("lr", 1e-3)),
+        "max_steps": None if max_steps is None else int(max_steps),
+        "recommended_out": RECOMMENDED_DIALOGUE_PREFIX_OUT,
+        "phase1_out_refused": PHASE1_PREFIX_DIR_NAME,
+        "writes": "only the --out directory",
+        "does_not_submit_kaggle": True,
+        "packed_windows_not_in_repo": True,
+        "confirm_required": True,
+        "val_lengths": [1, 4, 7, 32, "full"],
+        "note": DIALOGUE_PREFIX_NOTE,
+    }
+
+
+def prefix_content(prefixes: torch.Tensor, pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop pad ids and left-align what remains.
+
+    Chat strips pad before the prefix head. Stored dialogue prefixes are the
+    conditioning tail, right-padded, so the remaining tokens are that tail.
+    """
+    if not torch.is_tensor(prefixes) or prefixes.ndim != 2:
+        raise PrefixLevel0Error("dialogue prefixes must be a [batch, prefix_len] tensor")
+    if int(prefixes.shape[0]) < 1 or int(prefixes.shape[1]) < 1:
+        raise PrefixLevel0Error("dialogue prefixes are empty")
+    pad_id = int(pad_id)
+    rows = prefixes.long()
+    keep = rows != pad_id
+    content_lengths = keep.sum(dim=1)
+    if bool(torch.any(content_lengths < 1)):
+        raise PrefixLevel0Error("a dialogue prefix row has no tokens after dropping pad")
+    width = int(content_lengths.max().item())
+    content = rows.new_full((int(rows.shape[0]), width), pad_id)
+    positions = torch.cumsum(keep, dim=1) - 1
+    batch_index = torch.arange(int(rows.shape[0]), device=rows.device).unsqueeze(1).expand_as(rows)
+    content[batch_index[keep], positions[keep]] = rows[keep]
+    return content.contiguous(), content_lengths.long()
+
+
+def sample_dialogue_prefix_lengths(content_lengths: torch.Tensor, generator=None) -> torch.Tensor:
+    """Uniform T in ``1 .. content_lengths[i]`` so a short prompt stays in range.
+
+    T is never 0 and never longer than that row's unpadded prefix. A 7-token
+    ``User:`` line can be drawn in full. A longer conditioning prefix can
+    still draw a shorter T.
+    """
+    caps = content_lengths.detach().long().reshape(-1)
+    if int(caps.numel()) < 1:
+        raise PrefixLevel0Error("no dialogue prefix rows")
+    caps_cpu = caps.cpu()
+    if bool(torch.any(caps_cpu < 1)):
+        raise PrefixLevel0Error("unpadded prefix length must be >= 1")
+    if generator is None:
+        uniform = torch.rand(caps_cpu.shape)
+    else:
+        uniform = torch.rand(caps_cpu.shape, generator=generator)
+    drawn = 1 + torch.floor(uniform * caps_cpu.to(dtype=uniform.dtype)).to(dtype=torch.long)
+    drawn = torch.minimum(drawn, caps_cpu)
+    return drawn.to(device=caps.device)
+
+
+def resolve_dialogue_prefix_lengths(content_lengths: torch.Tensor, lengths=None, generator=None) -> torch.Tensor:
+    """Sample T, or check a caller-supplied T against each unpadded length."""
+    content_lengths = content_lengths.long().reshape(-1)
+    if lengths is None:
+        return sample_dialogue_prefix_lengths(content_lengths, generator=generator)
+    if isinstance(lengths, int):
+        requested = torch.full((int(content_lengths.shape[0]),), int(lengths), dtype=torch.long)
+    else:
+        requested = torch.as_tensor(lengths, dtype=torch.long).reshape(-1).cpu()
+    if int(requested.shape[0]) != int(content_lengths.shape[0]):
+        raise PrefixLevel0Error(
+            f"T has {int(requested.shape[0])} rows, prefixes have {int(content_lengths.shape[0])}"
+        )
+    caps = content_lengths.detach().cpu()
+    if bool(torch.any(requested < 1) or torch.any(requested > caps)):
+        raise PrefixLevel0Error(
+            "T must be in 1..unpadded prefix length for every row. "
+            "A longer T would include pad or assistant-reply tokens, which the head "
+            "does not see at inference."
+        )
+    return requested.to(device=content_lengths.device)
+
+
+def dialogue_head_batch(prefixes: torch.Tensor, pad_id: int, lengths=None, generator=None):
+    """Token ids the head may attend, plus the T used and the unpadded lengths.
+
+    The tensor is only as wide as the longest T in the batch. Positions at
+    or past T are masked by the head. Those ids are a prefix of the unpadded
+    pack row, not a slice of the full window.
+    """
+    content, content_lengths = prefix_content(prefixes, pad_id)
+    chosen = resolve_dialogue_prefix_lengths(content_lengths, lengths, generator)
+    width = int(chosen.max().item())
+    return content[:, :width].contiguous(), chosen, content_lengths
+
+
+def train_dialogue_prefix_step(
+    head,
+    optimizer,
+    vqvae,
+    tokens: torch.Tensor,
+    prefixes: torch.Tensor,
+    pad_id: int,
+    grad_clip: float = 1.0,
+    lengths=None,
+) -> dict:
+    """One head update. The target is the full window's level-0 code.
+
+    The input is the unpadded dialogue prefix, not the first T tokens of the
+    window. Embeddings are detached. The tokenizer is not optimized.
+    """
+    head.train()
+    tokens = tokens.long()
+    prefixes = prefixes.long()
+    if tokens.ndim != 2 or prefixes.ndim != 2:
+        raise PrefixLevel0Error(
+            f"dialogue training needs windows [batch, context] and prefixes [batch, prefix_len], "
+            f"got {tuple(tokens.shape)} and {tuple(prefixes.shape)}"
+        )
+    if int(tokens.shape[0]) != int(prefixes.shape[0]):
+        raise PrefixLevel0Error("dialogue prefix rows do not match windows")
+    with torch.no_grad():
+        target = vqvae.encode(tokens)[:, 0].long()
+        token_ids, chosen, content_lengths = dialogue_head_batch(prefixes, pad_id, lengths=lengths)
+        embeddings = embed_prompt_tokens(vqvae.encoder.wte, token_ids).detach()
+    optimizer.zero_grad(set_to_none=True)
+    logits = head(embeddings, chosen)
+    if int(logits.shape[-1]) <= int(target.max()):
+        raise PrefixLevel0Error("level-0 target is outside the head codebook")
+    loss = F.cross_entropy(logits, target)
+    if not torch.isfinite(loss):
+        raise PrefixLevel0Error("prefix-head loss is not finite")
+    loss.backward()
+    _forbid_frozen_grad(vqvae)
+    grad_norm = torch.nn.utils.clip_grad_norm_(list(head.parameters()), float(grad_clip))
+    optimizer.step()
+    return {
+        "loss": float(loss.detach().cpu()),
+        "grad_norm": float(grad_norm),
+        "mean_T": float(chosen.detach().float().mean().cpu()),
+        "lengths": chosen.detach().cpu(),
+        "content_lengths": content_lengths.detach().cpu(),
+        "head_token_ids": token_ids.detach().cpu(),
+        "target": target.detach().cpu(),
+    }
+
+
+@torch.no_grad()
+def dialogue_prefix_ce(head, vqvae, windows, prefixes, pad_id, length, batch_size: int = 8):
+    """Cross-entropy at a fixed T, or at each row's full unpadded length.
+
+    ``length`` None uses that full length. A fixed T skips rows shorter than
+    T instead of reading pad or the assistant reply. Returns ``(mean, rows)``.
+    ``mean`` is None when no row is long enough.
+    """
+    was_training = head.training
+    head.eval()
+    content, content_lengths = prefix_content(prefixes, int(pad_id))
+    if length is None:
+        chosen = content_lengths
+        eligible = torch.ones(int(content_lengths.shape[0]), dtype=torch.bool)
+    else:
+        fixed = int(length)
+        if fixed < 1:
+            raise PrefixLevel0Error("validation T must be >= 1")
+        eligible = content_lengths >= fixed
+        chosen = torch.full_like(content_lengths, fixed)
+    index = eligible.nonzero(as_tuple=False).flatten()
+    if int(index.numel()) < 1:
+        head.train(was_training)
+        return None, 0
+    total = 0.0
+    count = 0
+    device = next(head.parameters()).device
+    step = max(int(batch_size), 1)
+    width = int(chosen.index_select(0, index).max().item())
+    windows = windows.long()
+    for start in range(0, int(index.numel()), step):
+        batch_index = index[start : start + step]
+        batch_windows = windows.index_select(0, batch_index).to(device)
+        token_ids = content.index_select(0, batch_index)[:, :width].to(device)
+        lengths = chosen.index_select(0, batch_index).to(device)
+        embeddings = embed_prompt_tokens(vqvae.encoder.wte, token_ids)
+        target = vqvae.encode(batch_windows)[:, 0].long()
+        logits = head(embeddings, lengths)
+        total += float(F.cross_entropy(logits, target, reduction="sum").detach().cpu())
+        count += int(batch_windows.shape[0])
+    head.train(was_training)
+    return total / max(count, 1), count
+
+
+def _dialogue_val_metrics(head, vqvae, windows, prefixes, pad_id, batch_size: int) -> dict:
+    metrics = {}
+    rows = {}
+    for length in _DIALOGUE_VAL_LENGTHS:
+        value, count = dialogue_prefix_ce(
+            head, vqvae, windows, prefixes, pad_id, length, batch_size=batch_size
+        )
+        key = f"val_ce_T{length}"
+        metrics[key] = value
+        rows[key] = int(count)
+    value, count = dialogue_prefix_ce(
+        head, vqvae, windows, prefixes, pad_id, None, batch_size=batch_size
+    )
+    metrics["val_ce_Tfull"] = value
+    rows["val_ce_Tfull"] = int(count)
+    metrics["val_ce_rows"] = rows
+    return metrics
+
+
+def _require_generator_prefix(meta: dict, prefix_len: int, prefix_source: str) -> None:
+    recorded = recorded_prefix(meta)
+    if recorded is None or "prefix_len" not in recorded or "prefix_source" not in recorded:
+        raise PrefixLevel0Error(
+            "generator checkpoint does not record prefix_len and prefix_source. "
+            "train-prefix-level0-dialogue needs a frozen phase-2 or phase-3 generator "
+            "whose prefix matches this config. The generator is not trained."
+        )
+    architecture = meta.get("architecture")
+    if meta.get("predict_level0") is True or (
+        isinstance(architecture, dict) and architecture.get("predict_level0") is True
+    ):
+        raise PrefixLevel0Error("predict_level0 must stay false on the frozen generator")
+    problems = prefix_metadata_problems(recorded, int(prefix_len), prefix_source)
+    if problems:
+        raise PrefixLevel0Error(
+            "generator checkpoint prefix does not match this config: "
+            + "; ".join(problems)
+            + ". The generator is not trained."
+        )
+
+
+def _checkpoint_extra(prefix_len: int, dataset_id: str, placement: str, **more) -> dict:
+    extra = {
+        "prefix_len": int(prefix_len),
+        "prefix_source": "window",
+        "predict_level0": False,
+        "dataset": str(dataset_id),
+        "history_placement": str(placement),
+        "command": "train-prefix-level0-dialogue",
+        "tokenizer_updated": False,
+        "generator_updated": False,
+        "generator_loaded": True,
+        "features": (
+            "unpadded dialogue prefix rows, pad stripped; T is drawn from 1 through that length"
+        ),
+        "target": "level-0 code of the full packed window",
+    }
+    extra.update(more)
+    return extra
+
+
+def run_prefix_level0_dialogue(
+    cfg: dict,
+    tokenizer_path,
+    generator_path,
+    packed_path,
+    out,
+    dataset_id,
+    max_steps: int = 1,
+    batch_size: int = 8,
+    lr: float = 1e-3,
+    weight_decay: float = 0.01,
+    seed: int | None = None,
+    device: str | torch.device | None = "auto",
+    log_every: int = 10,
+    val_every: int = 50,
+    save_every: int = 100,
+    unigram_windows: int = 256,
+    val_windows: int | None = None,
+    grad_clip: float = 1.0,
+    resume=None,
+) -> dict:
+    """Train only the prefix head on a dialogue pack.
+
+    The generator is loaded, checked against this config's prefix, and frozen.
+    Book windows are not read. Validation uses the pack's visible split whole.
+    """
+    settings = _dialogue_prefix_config(cfg)
+    if not str(dataset_id or "").strip():
+        raise PrefixLevel0Error(
+            "train-prefix-level0-dialogue needs --dataset-id. No dialogue corpus is selected."
+        )
+    if val_windows is not None and int(val_windows) > 0:
+        raise PrefixLevel0Error(
+            "dialogue validation uses the pack's visible split and is not cut to --val-windows. "
+            "Omit that limit."
+        )
+    if int(max_steps) < 1:
+        raise PrefixLevel0Error("--max-steps must be >= 1")
+    if int(batch_size) < 1:
+        raise PrefixLevel0Error("--batch-size must be >= 1")
+    if float(lr) <= 0:
+        raise PrefixLevel0Error("--lr must be positive")
+    if int(log_every) < 1 or int(val_every) < 1 or int(save_every) < 1:
+        raise PrefixLevel0Error("--log-every, --val-every, and --save-every must be >= 1")
+    if generator_path is None or str(generator_path).strip() in {"", "none"}:
+        raise PrefixLevel0Error(
+            "train-prefix-level0-dialogue needs --generator. "
+            "The file is loaded and frozen so its prefix_len and prefix_source can be checked. "
+            "It is not trained."
+        )
+    out = Path(out)
+    tokenizer_path = Path(tokenizer_path)
+    packed_path = Path(packed_path)
+    generator_path = Path(generator_path)
+    resume = None if resume is None or str(resume).strip() in {"", "none"} else Path(str(resume))
+    try:
+        refuse_finetune_output(out, [tokenizer_path, packed_path, generator_path])
+        if resume is not None:
+            try:
+                resume.resolve().relative_to(out.resolve())
+            except ValueError:
+                refuse_finetune_output(out, [resume])
+    except FinetuneError as exc:
+        raise PrefixLevel0Error(str(exc)) from exc
+    if out.exists() and not out.is_dir():
+        raise PrefixLevel0Error(f"--out is a file: {out}")
+    out.mkdir(parents=True, exist_ok=True)
+
+    prefix_len = int(cfg["generator"]["prefix_len"])
+    seed_value = int(cfg["seed"] if seed is None else seed)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+    resolved = resolve_device(device)
+    pretok, vqvae, generator = build_models(cfg)
+    try:
+        load_module_init(tokenizer_path, vqvae, "tokenizer")
+        generator_meta = load_module_init(generator_path, generator, "generator")
+    except FinetuneError as exc:
+        raise PrefixLevel0Error(str(exc)) from exc
+    _require_generator_prefix(generator_meta, prefix_len, "window")
+    lock_for_eval(vqvae)
+    lock_for_eval(generator)
+    vqvae.to(resolved)
+    generator.to(resolved)
+    tokenizer_before = _clone_params(vqvae)
+    generator_before = _clone_params(generator)
+
+    embed_dim = int(vqvae.embed_dim)
+    codebook_size = int(vqvae.vq.vqvae_vocab_sizes[0])
+    context_length = int(vqvae.context_length)
+    head = PrefixLevel0Head(embed_dim, codebook_size, context_length).to(resolved)
+    start = 0
+    resume_blob = None
+    if resume is not None:
+        resume_blob = read_prefix_blob(resume)
+        prefix_blob_matches(resume_blob, embed_dim, codebook_size, context_length)
+        state = _strip_module_prefix(resume_blob["model"])
+        try:
+            head.load_state_dict(state, strict=True)
+        except (RuntimeError, KeyError) as exc:
+            raise PrefixLevel0Error(f"prefix head state does not match this config: {exc}") from exc
+        start = int(resume_blob.get("step", 0))
+        if start >= int(max_steps):
+            raise PrefixLevel0Error(
+                f"checkpoint is already at step {start}, which is >= --max-steps {int(max_steps)}. "
+                "--max-steps is the step to reach, not an extra count."
+            )
+    optimizer = torch.optim.AdamW(head.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    if resume_blob is not None and isinstance(resume_blob.get("optimizer"), dict):
+        optimizer.load_state_dict(resume_blob["optimizer"])
+        _move_optimizer_state(optimizer, resolved)
+    head_before = _clone_params(head)
+    head_ids = {id(param) for param in head.parameters()}
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if id(param) not in head_ids:
+                raise PrefixLevel0Error("optimizer contains a parameter that is not part of the prefix head")
+
+    try:
+        train, val, train_prefix, val_prefix, meta = load_dialogue_windows(
+            packed_path,
+            context_length,
+            prefix_len,
+            dataset_id,
+            settings["history_placement"],
+        )
+    except FinetuneError as exc:
+        raise PrefixLevel0Error(str(exc)) from exc
+    if str(meta.get("history_placement")) == "window":
+        raise PrefixLevel0Error(
+            "history_placement window puts the assistant reply in the packed prefix. "
+            "train-prefix-level0-dialogue trains on conditioning tokens only."
+        )
+    pad_id = meta.get("pad_id")
+    if pad_id is None:
+        raise PrefixLevel0Error(f"{packed_path} is missing pad_id")
+    pad_id = int(pad_id)
+    if pad_id != int(pretok.pad_token_id):
+        raise PrefixLevel0Error(
+            f"{packed_path} pad_id {pad_id} does not match the tokenizer pad {int(pretok.pad_token_id)}"
+        )
+    if int(train.shape[0]) < int(batch_size):
+        raise PrefixLevel0Error(
+            f"need at least {int(batch_size)} training windows, found {int(train.shape[0])}. "
+            "Lower --batch-size or pass a larger packed file."
+        )
+
+    counts = level0_code_counts(vqvae, train, max_windows=int(unigram_windows), batch_size=int(batch_size))
+    _forbid_frozen_grad(vqvae, generator)
+    log_path = out / "train_log.jsonl"
+    latest = out / "prefix_level0.pt"
+    placement = str(meta.get("history_placement"))
+    dataset = str(meta.get("dataset"))
+    last = None
+    for step in range(start + 1, int(max_steps) + 1):
+        index = torch.randint(0, int(train.shape[0]), (int(batch_size),))
+        tokens = train.index_select(0, index).to(resolved)
+        prefix_batch = train_prefix.index_select(0, index).to(resolved)
+        last = train_dialogue_prefix_step(
+            head,
+            optimizer,
+            vqvae,
+            tokens,
+            prefix_batch,
+            pad_id,
+            grad_clip=float(grad_clip),
+        )
+        _forbid_frozen_grad(vqvae, generator)
+        row = {
+            "step": step,
+            "loss": last["loss"],
+            "grad_norm": last["grad_norm"],
+            "mean_T": last["mean_T"],
+            "mean_content_length": float(last["content_lengths"].float().mean()),
+            "lr": float(lr),
+        }
+        if step % int(val_every) == 0:
+            row.update(_dialogue_val_metrics(head, vqvae, val, val_prefix, pad_id, int(batch_size)))
+            row["val_unigram_nll"] = unigram_nll(counts, vqvae, val, batch_size=int(batch_size))
+        if step % int(log_every) == 0 or step == int(max_steps):
+            _append_jsonl(log_path, row)
+            print(json.dumps(row), flush=True)
+        if step % int(save_every) == 0:
+            save_prefix_head(
+                out / f"prefix_level0_step{step}.pt",
+                head,
+                step,
+                embed_dim=embed_dim,
+                codebook_size=codebook_size,
+                context_length=context_length,
+                config_name=cfg["name"],
+                extra=_checkpoint_extra(
+                    prefix_len,
+                    dataset,
+                    placement,
+                    optimizer=optimizer.state_dict(),
+                ),
+            )
+
+    if last is None:
+        raise PrefixLevel0Error("training produced no steps")
+    head.eval()
+    metrics = _dialogue_val_metrics(head, vqvae, val, val_prefix, pad_id, int(batch_size))
+    metrics["val_unigram_nll"] = unigram_nll(counts, vqvae, val, batch_size=int(batch_size))
+    metrics["uniform_nll"] = float(math.log(codebook_size))
+    _forbid_frozen_grad(vqvae, generator)
+    if not _params_equal(tokenizer_before, _clone_params(vqvae)):
+        raise PrefixLevel0Error("tokenizer weights changed during prefix-head training")
+    if not _params_equal(generator_before, _clone_params(generator)):
+        raise PrefixLevel0Error("generator weights changed during prefix-head training")
+    head_changed = not _params_equal(head_before, _clone_params(head))
+    save_prefix_head(
+        latest,
+        head,
+        int(max_steps),
+        embed_dim=embed_dim,
+        codebook_size=codebook_size,
+        context_length=context_length,
+        config_name=cfg["name"],
+        extra=_checkpoint_extra(
+            prefix_len,
+            dataset,
+            placement,
+            optimizer=optimizer.state_dict(),
+            **{key: value for key, value in metrics.items() if key != "val_ce_rows"},
+        ),
+    )
+    summary = {
+        "system": "NCM-iWSP-GPT1",
+        "command": "train-prefix-level0-dialogue",
+        "format": PREFIX_LEVEL0_FORMAT,
+        "checkpoint": str(latest),
+        "log": str(log_path),
+        "out": str(out),
+        "recommended_out": RECOMMENDED_DIALOGUE_PREFIX_OUT,
+        "steps": int(max_steps),
+        "resumed_from": start,
+        "last_loss": last["loss"],
+        "last_mean_T": last["mean_T"],
+        "last_lengths": [int(value) for value in last["lengths"].tolist()],
+        "last_content_lengths": [int(value) for value in last["content_lengths"].tolist()],
+        "tokenizer_unchanged": True,
+        "generator_unchanged": True,
+        "generator_loaded": True,
+        "head_changed": bool(head_changed),
+        "head_parameters": head_parameter_count(embed_dim, codebook_size, context_length),
+        "predict_level0": False,
+        "prefix_len": prefix_len,
+        "prefix_source": "window",
+        "history_placement": placement,
+        "dataset": dataset,
+        "context_length": context_length,
+        "codebook_size": codebook_size,
+        "embed_dim": embed_dim,
+        "device": str(resolved),
+        "seed": seed_value,
+        "val_every": int(val_every),
+        "packed": {
+            "kind": meta.get("kind"),
+            "path": str(packed_path),
+            "train_windows": int(train.shape[0]),
+            "val_windows": int(val.shape[0]),
+        },
+        "does_not_submit_kaggle": True,
+        "note": DIALOGUE_PREFIX_NOTE,
         **metrics,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

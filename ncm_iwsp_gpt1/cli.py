@@ -17,7 +17,14 @@ from ncm_iwsp_gpt1.chat import (
     run_interactive,
     run_prompt,
 )
-from ncm_iwsp_gpt1.prefix_level0 import PrefixLevel0Error, describe_prefix_run, run_prefix_level0
+from ncm_iwsp_gpt1.prefix_level0 import (
+    RECOMMENDED_DIALOGUE_PREFIX_OUT,
+    PrefixLevel0Error,
+    describe_prefix_dialogue_run,
+    describe_prefix_run,
+    run_prefix_level0,
+    run_prefix_level0_dialogue,
+)
 from ncm_iwsp_gpt1.config import load_config
 from ncm_iwsp_gpt1.convert import FORMAT_NAME, ConvertError, convert_files, load_converted_checkpoint
 from ncm_iwsp_gpt1.evaluate import evaluate_windows
@@ -278,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
             "The default config keeps a one-token end-of-text prefix. "
             "configs/target_phase2.yaml places the prompt in a longer prefix. "
             "Phase 3 is pack-dialogue and finetune-dialogue on configs/target_phase3.yaml. "
+            "train-prefix-level0-dialogue trains only the dialogue prefix head. "
             "No dialogue corpus is selected."
         ),
     )
@@ -464,6 +472,68 @@ def build_parser() -> argparse.ArgumentParser:
     train_prefix.add_argument("--device", default="auto", help="auto, cuda, or cpu")
     train_prefix.add_argument("--seed", type=int, default=None)
     train_prefix.set_defaults(func=_cmd_train_prefix_level0)
+
+    train_prefix_dialogue = sub.add_parser(
+        "train-prefix-level0-dialogue",
+        help="train only the level-0 head on a pack-dialogue cache; generator stays frozen",
+        description=(
+            "Train p(level-0 | unpadded dialogue prefix) on a pack-dialogue cache. "
+            "The prefix rows are the generator prefixes (right-padded). Pad is stripped, "
+            "matching chat, and T is drawn from 1 through that unpadded length so a short "
+            "User: line stays in distribution. The assistant reply is not part of this prefix. "
+            "The tokenizer and the generator stay frozen. predict_level0 stays false. "
+            "Requires a phase-3 config, --dataset-id matching the cache, --max-steps, and "
+            "--confirm. --dry-plan prints the plan and does not train. "
+            "Writes only to --out. The phase-1 directory ncm-iwsp-gpt1-prefix-level0 is refused. "
+            f"A later NicNicNic run can use {RECOMMENDED_DIALOGUE_PREFIX_OUT}. "
+            "That path is not required. This command does not submit a Kaggle job. "
+            "finetune-dialogue still does not retrain the prefix head."
+        ),
+    )
+    train_prefix_dialogue.add_argument("--config", default="configs/target_phase3.yaml")
+    train_prefix_dialogue.add_argument("--tokenizer", default=None, help="frozen tokenizer.pt (required to train)")
+    train_prefix_dialogue.add_argument(
+        "--generator",
+        default=None,
+        help="frozen phase-2 or phase-3 generator checkpoint; loaded to check prefix_len, not trained",
+    )
+    train_prefix_dialogue.add_argument("--packed", default=None, help="pack-dialogue cache; not committed")
+    train_prefix_dialogue.add_argument(
+        "--dataset-id",
+        default=None,
+        help="must match the cache; no default corpus",
+    )
+    train_prefix_dialogue.add_argument(
+        "--out",
+        default=None,
+        help=(
+            "directory for the prefix-head checkpoint and log. "
+            f"Not ncm-iwsp-gpt1-prefix-level0. Suggested: {RECOMMENDED_DIALOGUE_PREFIX_OUT}"
+        ),
+    )
+    train_prefix_dialogue.add_argument(
+        "--resume",
+        default=None,
+        help="optional prefix-level0 checkpoint to warm-start; read-only, copied into --out",
+    )
+    train_prefix_dialogue.add_argument("--dry-plan", action="store_true", help="print the run plan and exit without building")
+    train_prefix_dialogue.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required to train. Does not submit a Kaggle job.",
+    )
+    train_prefix_dialogue.add_argument("--max-steps", type=int, default=None, help="step to reach; required unless --dry-plan")
+    train_prefix_dialogue.add_argument("--batch-size", type=int, default=8)
+    train_prefix_dialogue.add_argument("--lr", type=float, default=1e-3)
+    train_prefix_dialogue.add_argument("--weight-decay", type=float, default=0.01)
+    train_prefix_dialogue.add_argument("--grad-clip", type=float, default=1.0)
+    train_prefix_dialogue.add_argument("--log-every", type=int, default=10)
+    train_prefix_dialogue.add_argument("--val-every", type=int, default=50)
+    train_prefix_dialogue.add_argument("--save-every", type=int, default=100)
+    train_prefix_dialogue.add_argument("--unigram-windows", type=int, default=256)
+    train_prefix_dialogue.add_argument("--device", default="auto", help="auto, cuda, or cpu")
+    train_prefix_dialogue.add_argument("--seed", type=int, default=None)
+    train_prefix_dialogue.set_defaults(func=_cmd_train_prefix_level0_dialogue)
 
     finetune = sub.add_parser(
         "finetune",
@@ -900,6 +970,68 @@ def _cmd_train_prefix_level0(args) -> int:
             save_every=args.save_every,
             unigram_windows=args.unigram_windows,
             val_windows=args.val_windows,
+            grad_clip=args.grad_clip,
+            resume=args.resume,
+        )
+    except PrefixLevel0Error as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_train_prefix_level0_dialogue(args) -> int:
+    cfg = load_config(args.config)
+    if args.dry_plan:
+        options = {
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "max_steps": args.max_steps,
+        }
+        try:
+            plan = describe_prefix_dialogue_run(cfg, options)
+        except PrefixLevel0Error as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(plan, indent=2))
+        return 0
+    if not args.confirm:
+        raise SystemExit(
+            "Pass --confirm after reviewing the input paths. "
+            "train-prefix-level0-dialogue trains only the prefix head. "
+            "The tokenizer and the generator stay frozen. "
+            "This command does not submit a Kaggle job."
+        )
+    if not args.dataset_id:
+        raise SystemExit(
+            "train-prefix-level0-dialogue needs --dataset-id. "
+            "No dialogue corpus is selected in this repository."
+        )
+    if args.max_steps is None:
+        raise SystemExit(
+            "train-prefix-level0-dialogue needs --max-steps. "
+            "This command does not start a long run on its own and does not submit a Kaggle job."
+        )
+    if not args.tokenizer or not args.generator or not args.packed or not args.out:
+        raise SystemExit(
+            "train-prefix-level0-dialogue needs --tokenizer, --generator, --packed, --dataset-id, and --out"
+        )
+    try:
+        summary = run_prefix_level0_dialogue(
+            cfg,
+            args.tokenizer,
+            args.generator,
+            args.packed,
+            args.out,
+            dataset_id=args.dataset_id,
+            max_steps=args.max_steps,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            seed=args.seed,
+            device=args.device,
+            log_every=args.log_every,
+            val_every=args.val_every,
+            save_every=args.save_every,
+            unigram_windows=args.unigram_windows,
             grad_clip=args.grad_clip,
             resume=args.resume,
         )

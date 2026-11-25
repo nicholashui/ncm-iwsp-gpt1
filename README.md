@@ -106,7 +106,7 @@ python -m ncm_iwsp_gpt1 finetune --config configs/target.yaml --dry-plan
 
 預設要一個前綴 level-0 頭（`--prefix-head`）。頭讀真實提示的 `encoder.wte`，抽出一個 level-0，不再把短句重複填滿 context。細碼仍由凍結的 generator 抽出再解碼。stderr 印 `level0_source=prefix_head`。沒有這個 checkpoint 就停下來，不會退回重複打包。對照組要寫明：`--level0-source packed`，或 `--level0-source unigram --packed packed_windows.pt`。
 
-這是延續，不是問答。「How are you?」不是要回「I'm fine」。訓練指令是 `python -m ncm_iwsp_gpt1 train-prefix-level0`，只更新這個頭。`packed_windows.pt` 不在 repo 裡，這裡不啟動長訓練，也不提交 Kaggle。細節在 [`docs/chat.md`](docs/chat.md)。
+這是延續，不是問答。「How are you?」不是要回「I'm fine」。訓練指令是 `python -m ncm_iwsp_gpt1 train-prefix-level0`，只更新這個頭。`train-prefix-level0-dialogue` 是另一條指令，只在 phase-3 的對話前綴上訓練這個頭；`train-prefix-level0` 仍然拒絕 `prefix_len != 1`。`packed_windows.pt` 不在 repo 裡，這裡不啟動長訓練，也不提交 Kaggle。細節在 [`docs/chat.md`](docs/chat.md)。
 
 Kaggle kernel [nicholashuihk/ncm-iwsp-gpt1-prefix-level0](https://www.kaggle.com/code/nicholashuihk/ncm-iwsp-gpt1-prefix-level0) version 2 跑完 20,000 step。前綴頭、指標和 `val_ce_vs_unigram.svg` 在 [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/)。v3 generator 權重仍然不在 git 裡。下面的 tokenizer 和 fine-tune 路徑只是例子。
 
@@ -126,7 +126,13 @@ cd /d e:\Project\ncm-iwsp-gpt1
 
 `--prompt` prints the decoded window on stdout. Omit it for the stdin loop. The default config keeps the generator prefix as `<|endoftext|>`. Phase 2 is `--config configs/target_phase2.yaml`: `prefix_len` 32, and the prompt is placed in that prefix (right-pad with pad id 50257). The small CPU file is `configs/gpt1_data_phase2.yaml` (`prefix_len` 8). See [`docs/chat.md`](docs/chat.md). This change does not start training. The v3 generator is not in git. The prefix head, its metrics, and the val-CE plot are in [`artifacts/kaggle-prefix-level0-v2/`](artifacts/kaggle-prefix-level0-v2/).
 
-Phase 3 is opt-in and does not select a corpus. `pack-dialogue` needs `--dataset-id`, an allow-list that contains that id, and `--license-note`. `configs/dialogue_allowlist.txt` ships with no ids. Banned names still go through the book packer's refusal. `finetune-dialogue` warm-starts from a phase-2 generator checkpoint, writes only to a new `--out`, requires `--confirm`, freezes the tokenizer, keeps `predict_level0` false, and does not retrain the prefix head. History placement is `prefix`, `window`, or `both` (`both` in the phase-3 yaml). Overflow drops the oldest tokens. `chat --dialogue` keeps history and prints a slice of the decoded window (512 tokens on the target config) only when the checkpoint format is `ncm-iwsp-gpt1-dialogue`. `ce_first` / `ce_mid` / `ce_last` stay the comparable code means. They are not a chatbot score. Details are in [`docs/chat.md`](docs/chat.md).
+Phase 3 is opt-in and does not select a corpus. `pack-dialogue` needs `--dataset-id`, an allow-list that contains that id, and `--license-note`. `configs/dialogue_allowlist.txt` ships with no ids. Banned names still go through the book packer's refusal. `finetune-dialogue` warm-starts from a phase-2 generator checkpoint, writes only to a new `--out`, requires `--confirm`, freezes the tokenizer, keeps `predict_level0` false, and does not retrain the prefix head. `--retrain-prefix-head` is still an error. History placement is `prefix`, `window`, or `both` (`both` in the phase-3 yaml). Overflow drops the oldest tokens. `chat --dialogue` keeps history and prints a slice of the decoded window (512 tokens on the target config) only when the checkpoint format is `ncm-iwsp-gpt1-dialogue`. `ce_first` / `ce_mid` / `ce_last` stay the comparable code means. They are not a chatbot score. Details are in [`docs/chat.md`](docs/chat.md).
+
+`train-prefix-level0-dialogue` is the separate head-only command for that phase-3 prefix (`prefix_len` 32, `prefix_source: window` on `configs/target_phase3.yaml`). It reads the pack with the dialogue loader. The head sees the unpadded prefix rows, and T is drawn from 1 through that length. The current assistant reply is not in the prefix. `--dataset-id` must match the cache. `--dry-plan` does not train. A real run also needs `--confirm` and `--max-steps`. The tokenizer and the generator stay frozen. Do not write to `ncm-iwsp-gpt1-prefix-level0`. The intended NicNicNic directory is `E:\Project\ncm-iwsp-gpt1-prefix-level0-phase3`; any other new `--out` is accepted. Aligning the head may still not yield coherent chat. A later run is a readable Dolly-format continuation, not a chatbot score.
+
+```bash
+python -m ncm_iwsp_gpt1 train-prefix-level0-dialogue --config configs/target_phase3.yaml --dry-plan
+```
 
 ## 安裝
 
@@ -265,7 +271,7 @@ Hidden split 的交叉熵只寫進 `hidden_metrics.jsonl`。`results.csv` 沒有
 | `ncm_iwsp_gpt1/chat.py` | 用真實提示抽 level 0；packed 與 unigram 是明示對照 |
 | `ncm_iwsp_gpt1/audit.py` | 訓練、下載、hidden 洩漏 |
 | `ncm_iwsp_gpt1/loop.py` | propose / write / eval / audit |
-| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert`、`finetune`、`chat`、`train-prefix-level0` |
+| `ncm_iwsp_gpt1/cli.py` | `pack`、`count`、`eval`、`loop`、`convert`、`finetune`、`chat`、`train-prefix-level0`、`train-prefix-level0-dialogue` |
 | `ncm_iwsp_gpt1/convert.py` | 閉式複製 tokenizer / body，展開 tied head，丟棄 post-upsample |
 | `ncm_iwsp_gpt1/finetune.py` | 從已轉換 init 梯度更新 untied generator；tokenizer 凍結 |
 | `docs/convert_from_gradient_checkpoint.md` | 公式、caveat、NicNicNic 與 Kaggle 指令 |
