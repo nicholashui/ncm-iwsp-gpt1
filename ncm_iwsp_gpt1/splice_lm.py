@@ -48,14 +48,23 @@ MODEL_DESCRIPTION = (
     "pad. Official reply extraction runs on the spliced window. The same "
     "rule is used for every window and for official chat. "
     "Before that splice, a general reply policy answers only the current "
-    "user question, keeps at most two sentences, and stops at end-of-turn "
-    "or the first complete assistant turn. A story, script, poem, or "
-    "customer-support dump is replaced with a short conversational reply. "
-    "The policy strips echoed user wording, role labels, and a reciprocal "
-    "follow-up answered in the same turn. It drops a time, place, or "
-    "appointment the user did not mention. It refuses or redirects harmful "
-    "and high-risk requests. A question with no concrete topic gets one "
-    "clarifying question. A preference is marked as an opinion. The "
+    "user question. A greeting, status check, thanks, or goodbye gets a "
+    "short social reply, and a goodbye is not answered with a greeting. "
+    "Ordinary replies stay within two sentences. A legitimate how-to may "
+    "use four short ordered steps. Generation stops at end-of-turn or when "
+    "that limit is complete. A story, script, poem, or customer-support "
+    "dump is replaced with a short conversational reply. Ordered steps are "
+    "not treated as a poem. The policy strips echoed user wording without "
+    "punching the task out of an instruction, strips role labels, strips a "
+    "reciprocal follow-up answered in the same turn, and strips sentences "
+    "that invent an earlier chat or narrate the policy. It drops a time, "
+    "place, or appointment the user did not mention. It refuses weapons, "
+    "unauthorized access, phishing, poisons, leftover prescriptions, "
+    "reckless all-in bets, lockpicking, shoplifting, stalking, anonymous "
+    "threats, vandalism, and fake credentials. Chest pain and similar "
+    "emergencies are redirected to emergency services or urgent care. A "
+    "question with no concrete topic gets one clarifying question. A clear "
+    "question is answered. A preference is marked as an opinion. The "
     "assistant body is fit to the reconstructed window with a reserved tail "
     "so the reply ends on a clause boundary."
 )
@@ -73,6 +82,8 @@ from ncm_iwsp_gpt1.reply_policy import (  # noqa: E402
     planner_token_action,
     prepare_assistant_body,
     safety_decision,
+    social_act,
+    social_reply,
     with_policy_messages,
 )
 
@@ -410,8 +421,11 @@ def plan_post_prefix_tokens(
     n_cond = official_nonpad_span(prefix_ids, pad_id)
     budget = assistant_body_budget(int(seq_len), n_cond, len(open_ids), WINDOW_TAIL_RESERVE)
     decision = safety_decision(user_text)
+    act = social_act(user_text)
     if decision is not None:
         body_text = decision["reply"]
+    elif act:
+        body_text = social_reply(act)
     elif is_underspecified(user_text, history_text=history_text):
         body_text = clarifying_question(user_text)
     else:
@@ -424,6 +438,7 @@ def plan_post_prefix_tokens(
             exclude_ids,
             horizon,
             pad_id,
+            user_text=user_text,
         )
     prepared = prepare_assistant_body(
         user_text,
@@ -459,6 +474,7 @@ def _generate_planned_text(
     exclude_ids,
     horizon,
     pad_id,
+    user_text="",
 ):
     """Greedy planner continuation. The caller applies reply policy to the text."""
     import torch
@@ -517,7 +533,7 @@ def _generate_planned_text(
             trial_text = _decode_ids(planner_tok, trial, skip_special=True)
             if _would_repeat_sentence(trial_text):
                 break
-            action = planner_token_action(prev_text, trial_text)
+            action = planner_token_action(prev_text, trial_text, user_text=user_text)
             if action == "drop":
                 break
             planned.append(raw_id)
@@ -525,7 +541,7 @@ def _generate_planned_text(
                 [ctx, torch.tensor([[raw_id]], device=planner_device, dtype=torch.long)],
                 dim=1,
             )
-            if action == "stop" or generation_should_stop(trial_text):
+            if action == "stop" or generation_should_stop(trial_text, user_text=user_text):
                 break
     if was_training:
         planner.train()
