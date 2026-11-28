@@ -21,3 +21,6 @@ runs/
 *.bin
 bookcorpus*
 .DS_Store
+# Local TinyLlama planner weights. Download them separately; do not commit them.
+planners/
+*.safetensors
