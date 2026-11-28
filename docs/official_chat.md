@@ -49,14 +49,15 @@ python -m ncm_iwsp_gpt1.chat_lmsplice \
 
 `python -m ncm_iwsp_gpt1 official-chat` takes the same flags. `--finetune` must be a dialogue checkpoint (`ncm-iwsp-gpt1-dialogue`). Omit `--prompt` for the stdin loop. Quit with `quit` or `exit`. `/clear` drops history.
 
-Before the splice, a general reply policy (not a table of questions) does seven things:
+Before the splice, a general reply policy (not a table of questions) does eight things:
 
-1. Answer only the current user question, in at most two sentences, and stop at end-of-turn or the first complete Assistant turn.
-2. If the planner emits a story, script, poem, or canned help-desk dump, replace it with a short conversational reply.
-3. Strip echoed user wording, `User:` / `Assistant:` labels, and a reciprocal follow-up answered in the same turn.
-4. Drop a time, place, or appointment the user did not mention.
-5. Keep a reserved tail in the reconstructed window and cut the body on a clause boundary so the reply is not sliced mid-clause.
-6. Refuse or give a safe alternative for harmful or high-risk requests (weapons, unauthorized access, phishing, poisons, leftover prescription drugs, reckless all-in financial advice, and similar harm).
-7. If the question has no concrete topic, ask one clarifying question. If it asks for a preference, mark the reply as an opinion.
+1. Answer only the current user question. A greeting, a short status check, thanks, or a goodbye gets one short social reply. A goodbye is not answered with a greeting, and the reply does not invent an earlier chat.
+2. Keep an ordinary reply to one or two sentences. A legitimate how-to may use four short ordered steps, then stop. Stop at end-of-turn or the first complete Assistant turn. Do not leave a bare lead-in.
+3. If the planner emits a story, script, poem, or canned help-desk dump, replace it with a short conversational reply. Ordered steps are not treated as a poem.
+4. Strip echoed user wording without deleting the task from an instruction that also adds steps. Strip `User` / `Assistant` labels, a reciprocal follow-up answered in the same turn, and any sentence that narrates the policy.
+5. Drop a time, place, or appointment the user did not mention. The visible reply does not describe that rule.
+6. Keep a reserved tail in the reconstructed window and cut the body on a clause boundary so the reply is not sliced mid-clause.
+7. Refuse or redirect harmful or high-risk requests: weapons, unauthorized access, phishing, poisons, leftover prescription drugs, reckless all-in bets (including speculative assets), lockpicking, shoplifting, stalking, anonymous threats, vandalism, fake credentials, and similar harm. Chest pain and similar emergencies are sent to emergency services or urgent care.
+8. If the question has no concrete topic, ask one clarifying question. If the question is already clear, answer it. If it asks for a preference, mark the reply as an opinion.
 
 `pytest tests/test_reply_policy.py` covers those helpers and does not load planner or generator weights.
