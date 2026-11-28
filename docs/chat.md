@@ -312,3 +312,7 @@ python -m ncm_iwsp_gpt1 chat \
 ```
 
 The phase-1 prefix head was not trained on dialogue and is not retrained here. A readable answer is not a result of this source change. Passing conditions for phase 3 are still unset. Code CE, a 2018 GPT-1 perplexity, and "the window looks like English" are not those conditions.
+
+## Official decode-side chat
+
+The continuation command above is not the official readable chat path. Official chat is `python -m ncm_iwsp_gpt1 official-chat` (or `python -m ncm_iwsp_gpt1.chat_lmsplice`). It keeps the frozen generator, requires `--dialogue` and `--prefix-head`, and splices a TinyLlama planner reply into the decoded window. TinyLlama weights are downloaded separately and are not in git. Details and the reply policy are in [`official_chat.md`](official_chat.md).

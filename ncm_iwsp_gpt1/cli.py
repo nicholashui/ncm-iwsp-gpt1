@@ -17,6 +17,8 @@ from ncm_iwsp_gpt1.chat import (
     run_interactive,
     run_prompt,
 )
+from ncm_iwsp_gpt1.chat_lmsplice import DESCRIPTION as OFFICIAL_CHAT_DESCRIPTION
+from ncm_iwsp_gpt1.chat_lmsplice import add_parser_arguments, execute as execute_official_chat
 from ncm_iwsp_gpt1.prefix_level0 import (
     RECOMMENDED_DIALOGUE_PREFIX_OUT,
     PrefixLevel0Error,
@@ -435,6 +437,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="phase 3 reply cap after slicing; 0 keeps the remainder of the window",
     )
     chat.set_defaults(func=_cmd_chat)
+
+    official = sub.add_parser(
+        "official-chat",
+        help="decode-side dialogue chat with a frozen TinyLlama planner splice",
+        description=OFFICIAL_CHAT_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_parser_arguments(official)
+    official.set_defaults(func=execute_official_chat)
 
     train_prefix = sub.add_parser(
         "train-prefix-level0",

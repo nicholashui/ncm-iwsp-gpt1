@@ -134,6 +134,12 @@ Phase 3 is opt-in and does not select a corpus. `pack-dialogue` needs `--dataset
 python -m ncm_iwsp_gpt1 train-prefix-level0-dialogue --config configs/target_phase3.yaml --dry-plan
 ```
 
+## Official decode-side chat
+
+`python -m ncm_iwsp_gpt1 official-chat` is the readable dialogue path. It is still NCM-iWSP-GPT1, not NCM-GPT1, and not causal token continuation. The prefix head predicts level 0, the frozen generator samples later residual VQ levels, VQ decode reconstructs one window, a decode-side splice writes the Assistant body, and the reply slice keeps that span. `--dialogue`, temperature 0, and `--prefix-head` are required. A missing prefix head stops the command.
+
+The planner is TinyLlama/TinyLlama-1.1B-Chat-v1.0 (Apache-2.0). Download it separately with `python -m ncm_iwsp_gpt1.download_planner`. Do not commit those weights. Paths are flags or `NCM_TOKENIZER`, `NCM_FINETUNE`, `NCM_PREFIX_HEAD`, and `NCM_PLANNER_DIR`. See [`docs/official_chat.md`](docs/official_chat.md) and `scripts/official_chat.sh`.
+
 ## 安裝
 
 在專案根目錄建一個本地 `.venv`。它已經在 `.gitignore` 裡，不要提交。先用這個 venv 的 Python 裝 PyTorch，再裝 `requirements.txt`。下面的 CPU index 是通用文件。有 NVIDIA GPU 的機器請改裝與驅動相符的 CUDA wheel（見 [pytorch.org](https://pytorch.org)），然後同樣裝 `requirements.txt`。
